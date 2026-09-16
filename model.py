@@ -14,12 +14,16 @@ class GPTConfig:
     n_head: int = 6
     n_embd: int = 384
     dropout: float = 0.2
+    attention: str = "manual"
 
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0, "n_embd 需要能整除 n_head"
+        if cfg.attention not in ("manual", "sdpa"):
+            raise ValueError(f"不支持的 attention: {cfg.attention}")
+        self.attention = cfg.attention
         self.n_head = cfg.n_head
         self.head_dim = cfg.n_embd // cfg.n_head
         self.q_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
@@ -36,14 +40,20 @@ class CausalSelfAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
-        att = att.masked_fill(~mask, float("-inf"))
-
-        att = self.attn_dropout(F.softmax(att, dim=-1))
-
-        y = att @ v
+        if self.attention == "sdpa":
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+            )
+        else:
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+            att = att.masked_fill(~mask, float("-inf"))
+            att = self.attn_dropout(F.softmax(att, dim=-1))
+            y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.c_proj(y))
 

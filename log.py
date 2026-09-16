@@ -12,21 +12,15 @@ from pathlib import Path
 
 import torch
 
-# metrics.csv 的列定义。一步一行；只在评估步出现的指标留空。
-# peak_memory_mb 只在该步使用了 CUDA 时才有值；它是该步（含该步内发生的评估）
-# 的峰值 allocated 显存，CPU 运行时留空。
+# 训练指标一步一行，在评估点批量写入。
+# val_loss / grad_norm / wall_time_s 只在评估步有值；性能指标由 benchmark.py 记录。
 METRIC_FIELDS = (
     "step",
     "tokens_seen",
     "train_loss_step",
-    "train_loss_eval",
     "val_loss",
     "lr",
     "grad_norm",
-    "step_time_s",
-    "train_tokens_per_sec",
-    "peak_memory_mb",
-    "eval_time_s",
     "wall_time_s",
 )
 
@@ -108,47 +102,18 @@ def _format_value(value):
 
 
 class RunLogger:
-    """管理一次实验的目录：写入 config.json 并逐行追加 metrics.csv。
+    """为每次实验创建独立目录，不覆盖或追加旧实验。"""
 
-    metrics.csv 每写入一行就 flush，训练中断也能保留已有记录。
-    append=True 时复用已有目录继续追加（续训场景），会先校验表头一致。
-    """
-
-    def __init__(self, run_dir, append=False):
-        if append:
-            self.run_dir = Path(run_dir)
-            self.run_dir.mkdir(parents=True, exist_ok=True)
-            self.metrics_path = self.run_dir / "metrics.csv"
-            empty = (
-                not self.metrics_path.exists() or self.metrics_path.stat().st_size == 0
-            )
-            if not empty:
-                self._check_header(self.metrics_path)
-            self._handle = self.metrics_path.open("a", newline="", encoding="utf-8")
-            self._writer = csv.DictWriter(
-                self._handle, fieldnames=METRIC_FIELDS, restval=""
-            )
-            if empty:
-                self._writer.writeheader()
-        else:
-            self.run_dir = unique_dir(run_dir)
-            self.run_dir.mkdir(parents=True)
-            self.metrics_path = self.run_dir / "metrics.csv"
-            self._handle = self.metrics_path.open("w", newline="", encoding="utf-8")
-            self._writer = csv.DictWriter(
-                self._handle, fieldnames=METRIC_FIELDS, restval=""
-            )
-            self._writer.writeheader()
+    def __init__(self, run_dir):
+        self.run_dir = unique_dir(run_dir)
+        self.run_dir.mkdir(parents=True)
+        self.metrics_path = self.run_dir / "metrics.csv"
+        self._handle = self.metrics_path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(
+            self._handle, fieldnames=METRIC_FIELDS, restval=""
+        )
+        self._writer.writeheader()
         self._handle.flush()
-
-    @staticmethod
-    def _check_header(path):
-        with path.open(newline="", encoding="utf-8") as handle:
-            header = handle.readline().strip()
-        if header.split(",") != list(METRIC_FIELDS):
-            raise RuntimeError(
-                f"{path} 的表头与当前指标定义不一致，无法追加写入；请改用新的实验目录"
-            )
 
     def write_json(self, name, payload):
         path = self.run_dir / name

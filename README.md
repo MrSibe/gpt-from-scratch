@@ -1,136 +1,116 @@
 # mrsibe-llm
 
-从可读的字符级 GPT 出发，逐步学习 Transformer 架构、训练优化和推理优化。
-当前实现是手写因果注意力、Pre-LayerNorm、绝对位置编码和 GELU FFN 的 decoder-only 模型。
+从可读的字符级 GPT 出发，逐步学习 Transformer、训练和推理优化。
+模型是 Pre-LayerNorm + 绝对位置编码 + GELU FFN 的 decoder-only GPT，支持手写因果注意力与 SDPA。
 
-- [学习与优化路线](docs/ROADMAP.md)：阶段目标、实验顺序、指标和验收标准。
-- `model.py`：模型和自回归生成。
-- `data.py`：字符编码、数据划分和 batch 采样。
-- `train.py` / `generate.py`：训练和生成入口。
-- `runlog.py`：实验目录、配置快照和指标 CSV。
-- `plot.py`：对比多个实验的曲线。
-- `tests/test_smoke.py`：正确性、实验记录与训练→保存→生成闭环测试。
+| 文件 | 作用 |
+| --- | --- |
+| `model.py` | 模型与自回归生成 |
+| `data.py` | 字符编码、数据划分、batch 采样 |
+| `train.py` | 训练、验证指标、保存最佳模型 |
+| `generate.py` | 加载 `best.pt` 生成文本 |
+| `benchmark.py` | 独立的训练计算测速 |
+| `log.py` | 运行目录、配置快照、指标 CSV |
+| `plot.py` | 多实验训练曲线对比 |
 
 ## 环境
 
-Python 3.12+，使用 uv 安装依赖：
+Python 3.12+，使用 uv：
 
 ```bash
 uv sync
 ```
 
-当前项目在 Linux/Windows 上配置了 PyTorch CUDA 13.0 包源；使用 GPU 需要匹配的驱动。
-脚本默认在 CUDA 可用时使用 GPU，也可以通过 `--device cpu` 强制使用 CPU。
+Linux/Windows 配置了 PyTorch CUDA 13.0 包源，GPU 需要匹配的驱动。
+脚本默认在 CUDA 可用时使用 GPU，也可用 `--device cpu` 强制 CPU。
 
-## 快速验证闭环
-
-下面是小模型短跑，只验证流程，不代表训练质量。默认数据文件不存在时会下载 Tiny Shakespeare，需要联网。
-若 `out/smoke` 已存在，目录名会自动变成 `out/smoke-2` 等，请以打印出的路径为准。
+## 训练与生成
 
 ```bash
 uv run python train.py \
   --device cpu --block-size 32 --batch-size 4 \
   --n-layer 1 --n-head 2 --n-embd 32 \
   --max-iters 10 --eval-interval 10 --eval-iters 2 \
-  --out-dir out/smoke
+  --run-name smoke
 
+# 目录名以训练时打印的为准
 uv run python generate.py \
-  --device cpu --ckpt out/smoke/best.pt \
+  --device cpu --ckpt runs/<时间戳>-smoke/best.pt \
   --prompt "To be" --tokens 100 --seed 1337
 ```
 
-使用 `--data /path/to/corpus.txt` 可以指定本地 UTF-8 文本。
-当前按前 90% / 后 10% 划分训练集和验证集，每部分都需要至少 `block_size + 2` 个字符。
-生成 prompt 必须非空，且所有字符都在训练词表内；temperature 应大于零。
+- 默认数据 `input.txt`，不存在时联网下载 Tiny Shakespeare；`--data` 可指定本地 UTF-8 文本。
+- 前 90% / 后 10% 为训练集 / 验证集，两部分各需至少 `block_size + 2` 个字符。
+- 实验目录固定为 `runs/<本地时间>-<run-name>/`，重名自动追加后缀，不覆盖旧实验。
+- 生成时 prompt 需非空且字符都在训练词表内，`temperature` 需大于 0。
+- `n-embd` 必须整除 `n-head`；`run-name` 不能包含路径分隔符。
+- 完整默认训练：`uv run python train.py`；显存不足先减小 `--batch-size`。
 
-完整默认配置的训练：
+### 实验变量
 
-```bash
-uv run python train.py
-```
+`train.py` 与 `benchmark.py` 共有：
 
-不指定 `--out-dir` 时，实验目录是 `runs/<本地时间>-gpt<n_layer>x<n_embd>/`，例如
-`runs/20260916-170355-gpt6x384/`；该路径会直接打印出来。
-默认模型比短跑配置大得多；显存不足时，先减小 `--batch-size`，必要时减小上下文和模型规模。
-更多参数见 `uv run python train.py --help` 和 `uv run python generate.py --help`。
+- `--attention manual|sdpa`：默认 manual。SDPA 使用因果模式，评估时关闭 dropout；
+  后端由 PyTorch 自动选择，**不保证使用 FlashAttention**。
+- `--dtype fp32|fp16|bf16`：默认 fp32。低精度仅支持 CUDA，用 autocast，权重保持 FP32；
+  FP16 启用 GradScaler（梯度溢出会跳过该步更新），BF16 需设备支持。
+- `--compile`：只编译模型的 forward/backward，不含 Python 主循环和优化器。
 
-## 实验记录
+一次只改一个主要变量，先验正确性再测性能。不同精度/后端不保证逐位一致；
+`step` 是迭代次数，`tokens_seen` 才是实际处理的训练 token 数。
 
-每次训练都会写入一个独立目录（默认在 `runs/` 下，已被 git 忽略）：
+## 训练记录
 
 ```text
-runs/20260916-170355-gpt6x384/
-  config.json    模型/训练配置、数据摘要、代码版本和运行环境
-  metrics.csv    每步一行的指标，可直接用 pandas 或表格软件读取
-  best.pt        验证 loss 最低的权重，供 generate.py 使用
-  summary.json   训练结束时的汇总
+runs/<时间戳>-<run-name>/
+  config.json    模型/训练配置、数据 SHA-256、代码版本、运行环境
+  metrics.csv    每步训练 loss；评估点批量写入
+  best.pt        验证 loss 最低的权重、配置和词表
+  summary.json   best loss、best step、总时间、全程峰值显存
 ```
 
-- 目录已存在时自动改用 `-2`、`-3` 后缀，不会覆盖旧实验；实际路径在启动时打印。
-- `metrics.csv` 的列定义见 `runlog.py` 中的 `METRIC_FIELDS`，每行对应一次参数更新：
+| CSV 列 | 含义 |
+| --- | --- |
+| `step` / `tokens_seen` | 训练迭代 / 累计训练 token（不含评估） |
+| `train_loss_step` | 当前 batch 的训练 loss，含 dropout |
+| `lr` | 学习率 |
+| `val_loss` | 固定验证样本的平均 loss，仅评估点记录 |
+| `grad_norm` | 更新前的全局梯度 L2 范数，仅评估点计算；FP16 先 unscale，不裁剪 |
+| `wall_time_s` | 含评估、保存和编译冷启动的累计时间，仅评估点记录 |
 
-  | 列 | 含义 |
-  | --- | --- |
-  | `step` / `tokens_seen` | 已完成的参数更新次数 / 累计训练 token（不含评估） |
-  | `train_loss_step` | 当前步的训练 loss |
-  | `train_loss_eval` / `val_loss` | 评估时的平均训练/验证 loss，只在评估步有值 |
-  | `lr` / `grad_norm` | 学习率 / 裁剪前梯度范数（尚未启用裁剪） |
-  | `step_time_s` / `train_tokens_per_sec` | 单步时间 / 该步训练吞吐 |
-  | `peak_memory_mb` | 该步（含该步内的评估）CUDA 峰值 allocated 显存，CPU 运行时为空 |
-  | `eval_time_s` / `wall_time_s` | 该次评估耗时 / 从训练开始累计的时间 |
+- 普通训练步不读取 CUDA 标量，loss 先留在设备上，到评估点才批量写盘；
+  中断会丢失最近一段未写入的 loss（数据传输和 FP16 scaler 仍可能同步）。
+- 只评估 val，用固定 seed 的独立生成器复用同一批验证样本，最后一步也评估。
+- 峰值显存在训练循环前重置（不含模型初始化），覆盖训练、评估和编译全程，CPU 为 null。
+- 只保存 `best.pt`，无优化器/RNG 状态，不支持续训。加载用 `weights_only=True`，
+  编译训练也保存标准权重名。
 
-- 评估使用独立随机数流，并在每个评估点复用同一组固定 batch：
-
-  - 改 `--eval-interval` 不会改变训练数据顺序，两次实验的逐步训练指标可以逐位对比；
-  - 同 `--seed` 的实验使用完全相同的评估样本。
-- `wall_time_s` 是从训练开始累计的时间，包含评估和保存；续训时在已有数值上继续累加，
-  因此在同一个实验目录内始终单调不减。只有 `step_time_s` / `train_tokens_per_sec` 是纯训练指标。
-- `last.pt` 在每个评估点写入，体积约为 `best.pt` 的两倍以上（含 AdamW 的一阶/二阶矩）。
-  它不进 `step_time_s`，但会计入 `wall_time_s`；评估间隔很小时写盘开销会明显。
-
-### 续训
+## 独立测速
 
 ```bash
-uv run python train.py --resume runs/20260916-170355-gpt6x384/last.pt --max-iters 10000
+uv run python benchmark.py \
+  --device cuda --attention sdpa --dtype bf16 \
+  --batch-size 16 --block-size 256 \
+  --warmup 50 --steps 100 --repeats 5 --run-name sdpa-bf16
 ```
 
-- `--max-iters` 是包含已完成步数在内的**总步数目标**，必须大于 checkpoint 里的 `iter`。
-- 恢复内容：模型权重、AdamW 优化器状态、全局与训练生成器的随机数状态、累计训练时间、best loss。
-  指标追加到同一个 `metrics.csv`，不新建目录，也不重复表头。
-- 以 checkpoint 为准（命令行给不同值时只提示、不生效）：模型结构、`block_size`、
-  `batch_size`、`seed`。可以自由调整的是 `--max-iters`、`--eval-interval`、`--eval-iters`。
-- 数据文件的 SHA-256 或词表不一致时会拒绝续训，避免静默换数据。
-- 保存的随机数状态对应“最后一个训练步结束之后”：评估使用独立随机数流，不会推进训练随机数流。
-  同一次实验内续训可以复现连续训练的逐步指标（CPU 测试校验到 1e-9；GPU 上不同进程之间
-  本身存在 1e-6 级非确定性，不能要求逐位相同）。
+- 使用固定的、已在设备上的合成 `(x, y)`，测的是训练计算，**不是端到端吞吐**。
+- 包含 forward、backward、AdamW 和 AMP scaler；排除采样、CPU→GPU 传输、评估、日志和保存。
+- 只在每个测量窗口两端显式同步，窗口内部不读取 loss、不计时。
+- 默认连续测 5 个窗口、每窗口 100 步，报告吞吐中位数/最小值/最大值和平均单步时间；
+  严谨对照还应重复启动进程并控制温度、功耗和后台负载。
+- `warmup_time_s` 含首次编译，不是纯编译耗时；warmup 太短或发生重编译会影响结果。
+- 显存峰值在 warmup 后重置，包含驻留的模型和优化器状态，排除 warmup 的瞬时峰值。
+- 输出 `config.json`、`benchmark.csv`、`summary.json`，不生成权重。`--vocab-size` 默认 65，
+  与真实训练比较时应匹配词表、模型、batch 和上下文长度。
 
-### 绘图
+## 绘图
 
 ```bash
-uv run python plot.py                        # 对比 runs/ 下全部实验
-uv run python plot.py runs/a runs/b          # 只对比指定实验
-uv run python plot.py --smooth 50 --out runs/latest.png
+uv run python plot.py
+uv run python plot.py runs/a runs/b --smooth 50 --out runs/comparison.png
 ```
 
-输出四张子图：验证 loss 对训练 token、验证 loss 对累计时间、逐步训练吞吐、逐步峰值显存。
-坐标轴标签使用英文，避免缺少中文字体的系统显示方块。
-图例取自目录名，并带上 `config.json` 中的参数量。
-
-## Checkpoint 约定
-
-- `best.pt` 保存验证 loss 最好的模型；`last.pt` 保存可续训的完整状态。
-- `config` 保存为普通字典；两种文件都用 `torch.load(..., weights_only=True)` 加载。
-- `iter` 表示已完成的参数更新次数；评估发生在更新后，最后一步也会评估。
-- `best.pt` 不含 optimizer / RNG，只用于推理；续训请用 `last.pt`。
-- 修复前将 `GPTConfig` 对象直接写入文件的旧 checkpoint 不兼容当前加载方式。建议重新训练；如需保留旧权重，应仅对自己信任的旧文件做离线格式迁移，不要通过关闭安全加载来打开来源不明的文件。
-
-## 测试
-
-```bash
-uv run python -m unittest discover -s tests -v
-```
-
-测试使用 CPU 和临时本地语料，不下载数据、不依赖 GPU，也不会覆盖 `runs/` 中的记录。
-覆盖前向/反向、因果性、小 batch 过拟合、保存加载一致性、导入无副作用、实验记录内容、
-评估随机数隔离（改变评估频率不改变训练指标）、续训一致性（续训与连续训练的逐步指标一致、
-拒绝换数据、累计时间单调）和 CLI 生成闭环，以及绘图脚本的冒烟测试。
+只读取含 `metrics.csv` 的训练目录（benchmark 目录自动跳过），
+输出验证 loss 对训练 token（含淡色训练曲线）和验证 loss 对累计时间两张子图。
+性能窗口数据见 `benchmark.csv`，深入排查瓶颈时再用 PyTorch Profiler。

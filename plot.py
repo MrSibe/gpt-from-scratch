@@ -20,7 +20,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 
-PANELS = ("val_loss_vs_tokens", "val_loss_vs_time", "throughput", "memory")
+PANELS = ("val_loss_vs_tokens", "val_loss_vs_time")
 
 
 def parse_args(argv=None):
@@ -126,9 +126,18 @@ def time_axis(values):
 
 
 def plot_runs(runs, smooth_window, out_path, dpi):
-    figure, axes = plt.subplots(2, 2, figsize=(13, 9))
+    figure, axes = plt.subplots(1, 2, figsize=(13, 5))
     axes = dict(zip(PANELS, axes.ravel()))
     loaded = {run_dir: load_run(run_dir) for run_dir in runs}
+    # 所有实验共用时间单位，不能把一个实验的分钟与另一个的秒画在同一轴。
+    all_times = [
+        t
+        for columns in loaded.values()
+        for t in columns.get("wall_time_s", [])
+        if t is not None
+    ]
+    _, unit = time_axis(all_times)
+    divisor = {"s": 1, "min": 60, "h": 3600}[unit]
 
     for run_dir, columns in loaded.items():
         label = label_for(run_dir)
@@ -147,46 +156,18 @@ def plot_runs(runs, smooth_window, out_path, dpi):
 
         xs, ys = series(columns, "wall_time_s", "val_loss")
         if xs:
-            xs, unit = time_axis(xs)
             axes["val_loss_vs_time"].plot(
-                xs, ys, marker="o", markersize=3, label=f"{label} [{unit}]"
+                [x / divisor for x in xs], ys, marker="o", markersize=3, label=label
             )
-
-        xs, ys = series(columns, "step", "train_tokens_per_sec")
-        if xs:
-            axes["throughput"].plot(
-                xs, smooth(ys, smooth_window), linewidth=1.2, label=label
-            )
-
-        xs, ys = series(columns, "step", "peak_memory_mb")
-        if xs:
-            axes["memory"].plot(xs, ys, linewidth=1.2, label=label)
 
     axes["val_loss_vs_tokens"].set(
         xlabel="training tokens seen", ylabel="loss (val solid, train faint)"
     )
     axes["val_loss_vs_tokens"].set_title("Val loss vs tokens")
     axes["val_loss_vs_time"].set(
-        xlabel="cumulative wall time (incl. eval)", ylabel="val loss"
+        xlabel=f"cumulative wall time ({unit}, incl. eval/save)", ylabel="val loss"
     )
     axes["val_loss_vs_time"].set_title("Val loss vs wall time")
-    axes["throughput"].set(xlabel="step", ylabel="tokens/s")
-    axes["throughput"].set_title("Training throughput per step")
-    axes["memory"].set(xlabel="step", ylabel="peak allocated MiB")
-    axes["memory"].set_title("Peak GPU memory per step")
-
-    if not any(
-        series(columns, "step", "peak_memory_mb")[0] for columns in loaded.values()
-    ):
-        axes["memory"].text(
-            0.5,
-            0.5,
-            "no CUDA memory data\n(CPU run, or column empty)",
-            ha="center",
-            va="center",
-            transform=axes["memory"].transAxes,
-        )
-
     for axis in axes.values():
         axis.grid(alpha=0.3)
         if axis.get_legend_handles_labels()[0]:

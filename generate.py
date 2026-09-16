@@ -18,7 +18,6 @@ def main():
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 新 checkpoint 只包含张量和基础 Python 类型，无需反序列化配置类。
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=True)
     cfg = GPTConfig(**ckpt["config"])
     model = GPT(cfg).to(device)
