@@ -10,6 +10,7 @@
 | `train.py` | 训练、验证指标、保存最佳模型 |
 | `generate.py` | 加载 `best.pt` 生成文本 |
 | `benchmark.py` | 独立的训练计算测速 |
+| `profiler.py` | 训练算子耗时、内存事件与可视化 trace |
 | `log.py` | 运行目录、配置快照、指标 CSV |
 | `plot.py` | 多实验训练曲线对比 |
 
@@ -48,7 +49,7 @@ uv run python generate.py \
 
 ### 实验变量
 
-`train.py` 与 `benchmark.py` 共有：
+`train.py`、`benchmark.py` 与 `profiler.py` 共有：
 
 - `--attention manual|sdpa`：默认 SDPA。SDPA 使用因果模式，评估时关闭 dropout；
   后端由 PyTorch 自动选择，**不保证使用 FlashAttention**。
@@ -105,6 +106,35 @@ uv run python benchmark.py \
 - 输出 `config.json`、`benchmark.csv`、`summary.json`，不生成权重。`--vocab-size` 默认 65，
   与真实训练比较时应匹配词表、模型、batch 和上下文长度。
 
+## 算子分析
+
+```bash
+uv run python profiler.py \
+  --device cuda --dtype bf16 \
+  --batch-size 16 --block-size 256 \
+  --warmup 10 --steps 5 --run-name profile-sdpa
+
+# 无 GPU 时先跑一个小模型
+uv run python profiler.py \
+  --device cpu --dtype fp32 --block-size 32 --batch-size 2 \
+  --n-layer 1 --n-head 2 --n-embd 32 --warmup 2 --steps 3
+```
+
+- 与 benchmark 一样使用固定设备上的合成 batch、新初始化模型，分析训练计算；
+  不读取数据或 checkpoint，不含采样、H2D、验证和保存权重。
+- 输出 `runs/<时间戳>-<run-name>/config.json`、`operators.txt` 和 `trace.json`。
+  `operators.txt` 按 CPU / CUDA self time 排序；CPU 时间不等于 GPU kernel 时间。
+- 用浏览器打开 <https://ui.perfetto.dev>，通过 **Open trace file** 加载 `trace.json`。
+  找到 `train/step` 下的 `train/forward`、`train/backward`、`train/optimizer` 等范围，
+  结合 GPU kernel 轨道观察耗时、空闲和实际使用的 SDPA 后端，不要仅凭参数推断 FlashAttention。
+- `--warmup` 在采集前运行（含首次编译和优化器状态初始化）；profiler 额外预热一步，
+  然后只记录 `--steps` 步。`--compile` 可用于观察编译后执行，但融合后算子粒度会变化。
+- 可选 `--record-shapes` 按输入形状分组、`--profile-memory` 记录分配/释放并输出内存排序表、
+  `--with-stack` 记录调用栈；这些选项会增加开销与 trace 大小，建议按需开启。
+  内存事件只覆盖采集窗口，不是完整显存快照，self memory 为净分配量，可能为负。
+- `--row-limit` 控制每张表的行数，默认 30。显存不足先减小 batch，trace 太大则减少 steps。
+  Profiler 会扰动性能，**不要用这里的耗时作为正式吞吐对照**，测速仍用 `benchmark.py`。
+
 ## 绘图
 
 ```bash
@@ -114,4 +144,4 @@ uv run python plot.py runs/a runs/b --smooth 50 --out runs/comparison.png
 
 只读取含 `metrics.csv` 的训练目录（benchmark 目录自动跳过），
 输出验证 loss 对训练 token（含淡色训练曲线）和验证 loss 对累计时间两张子图。
-性能窗口数据见 `benchmark.csv`，深入排查瓶颈时再用 PyTorch Profiler。
+性能窗口数据见 `benchmark.csv`，深入排查瓶颈使用 `profiler.py`。
