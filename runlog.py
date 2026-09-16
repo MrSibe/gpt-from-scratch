@@ -111,18 +111,44 @@ class RunLogger:
     """管理一次实验的目录：写入 config.json 并逐行追加 metrics.csv。
 
     metrics.csv 每写入一行就 flush，训练中断也能保留已有记录。
+    append=True 时复用已有目录继续追加（续训场景），会先校验表头一致。
     """
 
-    def __init__(self, run_dir):
-        self.run_dir = unique_dir(run_dir)
-        self.run_dir.mkdir(parents=True)
-        self.metrics_path = self.run_dir / "metrics.csv"
-        self._handle = self.metrics_path.open("w", newline="", encoding="utf-8")
-        self._writer = csv.DictWriter(
-            self._handle, fieldnames=METRIC_FIELDS, restval=""
-        )
-        self._writer.writeheader()
+    def __init__(self, run_dir, append=False):
+        if append:
+            self.run_dir = Path(run_dir)
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            self.metrics_path = self.run_dir / "metrics.csv"
+            empty = (
+                not self.metrics_path.exists() or self.metrics_path.stat().st_size == 0
+            )
+            if not empty:
+                self._check_header(self.metrics_path)
+            self._handle = self.metrics_path.open("a", newline="", encoding="utf-8")
+            self._writer = csv.DictWriter(
+                self._handle, fieldnames=METRIC_FIELDS, restval=""
+            )
+            if empty:
+                self._writer.writeheader()
+        else:
+            self.run_dir = unique_dir(run_dir)
+            self.run_dir.mkdir(parents=True)
+            self.metrics_path = self.run_dir / "metrics.csv"
+            self._handle = self.metrics_path.open("w", newline="", encoding="utf-8")
+            self._writer = csv.DictWriter(
+                self._handle, fieldnames=METRIC_FIELDS, restval=""
+            )
+            self._writer.writeheader()
         self._handle.flush()
+
+    @staticmethod
+    def _check_header(path):
+        with path.open(newline="", encoding="utf-8") as handle:
+            header = handle.readline().strip()
+        if header.split(",") != list(METRIC_FIELDS):
+            raise RuntimeError(
+                f"{path} 的表头与当前指标定义不一致，无法追加写入；请改用新的实验目录"
+            )
 
     def write_json(self, name, payload):
         path = self.run_dir / name

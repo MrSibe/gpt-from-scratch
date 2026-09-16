@@ -83,7 +83,26 @@ runs/20260916-170355-gpt6x384/
 
   - 改 `--eval-interval` 不会改变训练数据顺序，两次实验的逐步训练指标可以逐位对比；
   - 同 `--seed` 的实验使用完全相同的评估样本。
-- `wall_time_s` 包含评估和保存开销，只有 `step_time_s` / `train_tokens_per_sec` 是纯训练指标。
+- `wall_time_s` 是从训练开始累计的时间，包含评估和保存；续训时在已有数值上继续累加，
+  因此在同一个实验目录内始终单调不减。只有 `step_time_s` / `train_tokens_per_sec` 是纯训练指标。
+- `last.pt` 在每个评估点写入，体积约为 `best.pt` 的两倍以上（含 AdamW 的一阶/二阶矩）。
+  它不进 `step_time_s`，但会计入 `wall_time_s`；评估间隔很小时写盘开销会明显。
+
+### 续训
+
+```bash
+uv run python train.py --resume runs/20260916-170355-gpt6x384/last.pt --max-iters 10000
+```
+
+- `--max-iters` 是包含已完成步数在内的**总步数目标**，必须大于 checkpoint 里的 `iter`。
+- 恢复内容：模型权重、AdamW 优化器状态、全局与训练生成器的随机数状态、累计训练时间、best loss。
+  指标追加到同一个 `metrics.csv`，不新建目录，也不重复表头。
+- 以 checkpoint 为准（命令行给不同值时只提示、不生效）：模型结构、`block_size`、
+  `batch_size`、`seed`。可以自由调整的是 `--max-iters`、`--eval-interval`、`--eval-iters`。
+- 数据文件的 SHA-256 或词表不一致时会拒绝续训，避免静默换数据。
+- 保存的随机数状态对应“最后一个训练步结束之后”：评估使用独立随机数流，不会推进训练随机数流。
+  同一次实验内续训可以复现连续训练的逐步指标（CPU 测试校验到 1e-9；GPU 上不同进程之间
+  本身存在 1e-6 级非确定性，不能要求逐位相同）。
 
 ### 绘图
 
@@ -99,10 +118,10 @@ uv run python plot.py --smooth 50 --out runs/latest.png
 
 ## Checkpoint 约定
 
-- `best.pt` 保存验证 loss 最好的模型。
-- `config` 保存为普通字典；生成端使用 `torch.load(..., weights_only=True)`。
+- `best.pt` 保存验证 loss 最好的模型；`last.pt` 保存可续训的完整状态。
+- `config` 保存为普通字典；两种文件都用 `torch.load(..., weights_only=True)` 加载。
 - `iter` 表示已完成的参数更新次数；评估发生在更新后，最后一步也会评估。
-- 当前文件用于推理，不包含 optimizer / RNG 等完整训练状态，**不支持断点续训**。
+- `best.pt` 不含 optimizer / RNG，只用于推理；续训请用 `last.pt`。
 - 修复前将 `GPTConfig` 对象直接写入文件的旧 checkpoint 不兼容当前加载方式。建议重新训练；如需保留旧权重，应仅对自己信任的旧文件做离线格式迁移，不要通过关闭安全加载来打开来源不明的文件。
 
 ## 测试
@@ -113,4 +132,5 @@ uv run python -m unittest discover -s tests -v
 
 测试使用 CPU 和临时本地语料，不下载数据、不依赖 GPU，也不会覆盖 `runs/` 中的记录。
 覆盖前向/反向、因果性、小 batch 过拟合、保存加载一致性、导入无副作用、实验记录内容、
-评估随机数隔离（改变评估频率不改变训练指标）和 CLI 生成闭环，以及绘图脚本的冒烟测试。
+评估随机数隔离（改变评估频率不改变训练指标）、续训一致性（续训与连续训练的逐步指标一致、
+拒绝换数据、累计时间单调）和 CLI 生成闭环，以及绘图脚本的冒烟测试。

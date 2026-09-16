@@ -48,12 +48,34 @@ def run_python(*args, cwd):
         env=env,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
         check=False,
     )
     if result.returncode != 0:
         raise AssertionError(f"{args} 失败:\n{result.stdout}{result.stderr}")
     return result.stdout
+
+
+def run_python_failing(*args, cwd):
+    env = os.environ.copy()
+    env.update(PYTHONPATH=str(ROOT), OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+    result = subprocess.run(
+        [sys.executable, *map(str, args)],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    if result.returncode == 0:
+        raise AssertionError(f"{args} 本应失败，但正常退出了:\n{result.stdout}")
+    return result.stdout + result.stderr
+
+
+def read_metrics(run_dir):
+    with (run_dir / "metrics.csv").open(newline="") as handle:
+        return list(csv.DictReader(handle))
 
 
 class ModelSmokeTests(unittest.TestCase):
@@ -179,6 +201,35 @@ class RunLoggerTests(unittest.TestCase):
             self.assertEqual(rows[0]["step"], "1")
             self.assertEqual(rows[0]["val_loss"], "")
 
+    def test_append_mode_keeps_single_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            first = RunLogger(run_dir)
+            first.log(step=1, train_loss_step=1.0)
+            first.close()
+
+            resumed = RunLogger(run_dir, append=True)
+            self.addCleanup(resumed.close)
+            self.assertEqual(resumed.run_dir, run_dir)
+            resumed.log(step=2, train_loss_step=0.5)
+
+            with resumed.metrics_path.open(newline="") as handle:
+                text = handle.read()
+            self.assertEqual(text.count("step,tokens_seen"), 1)
+            self.assertEqual(
+                [row["step"] for row in csv.DictReader(io.StringIO(text))], ["1", "2"]
+            )
+
+    def test_append_mode_rejects_unknown_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "metrics.csv").write_text(
+                "other,columns\n1,2\n", encoding="utf-8"
+            )
+            with self.assertRaises(RuntimeError):
+                RunLogger(run_dir, append=True)
+
 
 class CLISmokeTests(unittest.TestCase):
     def setUp(self):
@@ -288,14 +339,120 @@ class CLISmokeTests(unittest.TestCase):
         self.train(frequent, "--max-iters", 3, "--eval-interval", 1)
         self.train(sparse, "--max-iters", 3, "--eval-interval", 100)
 
-        def train_losses(run_dir):
-            with (run_dir / "metrics.csv").open(newline="") as handle:
-                return [row["train_loss_step"] for row in csv.DictReader(handle)]
-
-        first, second = train_losses(frequent), train_losses(sparse)
+        first = [row["train_loss_step"] for row in read_metrics(frequent)]
+        second = [row["train_loss_step"] for row in read_metrics(sparse)]
         self.assertEqual(len(first), len(second))
         for left, right in zip(first, second):
             self.assertAlmostEqual(float(left), float(right), places=9)
+
+    def test_last_checkpoint_has_full_training_state(self):
+        out = self.tmp_path / "out"
+        self.train(out, "--max-iters", 2, "--eval-interval", 2)
+
+        last = torch.load(out / "last.pt", weights_only=True)
+        for key in ("model", "optimizer", "rng", "iter", "wall_time_s", "best_val"):
+            self.assertIn(key, last)
+        self.assertEqual(last["iter"], 2)
+        self.assertEqual(last["training"]["batch_size"], 2)
+        self.assertEqual(last["training"]["seed"], 1337)
+        self.assertEqual(
+            len(last["optimizer"]["state"]),
+            len(list(GPT(GPTConfig(**last["config"])).named_parameters())),
+        )
+        self.assertIn("torch", last["rng"])
+        self.assertIn("train_generator", last["rng"])
+        self.assertGreater(last["wall_time_s"], 0)
+
+        # best.pt 保持轻量，不包含优化器和随机数状态。
+        best = torch.load(out / "best.pt", weights_only=True)
+        self.assertNotIn("optimizer", best)
+        self.assertNotIn("rng", best)
+
+    def test_resume_reproduces_continuous_training(self):
+        """先跑 2 步再续训 2 步，应与一次跑 4 步逐步一致。"""
+        full = self.tmp_path / "full"
+        partial = self.tmp_path / "partial"
+        self.train(full, "--max-iters", 4, "--eval-interval", 2)
+        self.train(partial, "--max-iters", 2, "--eval-interval", 2)
+        self.train(
+            partial,
+            "--max-iters",
+            4,
+            "--eval-interval",
+            2,
+            "--resume",
+            partial / "last.pt",
+        )
+
+        continuous = read_metrics(full)
+        resumed = read_metrics(partial)
+        # 续训是追加写入，不会重复表头或丢行。
+        self.assertEqual([row["step"] for row in resumed], ["1", "2", "3", "4"])
+        for column in ("train_loss_step", "val_loss", "grad_norm"):
+            for expected, actual in zip(continuous, resumed):
+                if expected[column] == "" or actual[column] == "":
+                    self.assertEqual(expected[column], actual[column])
+                    continue
+                self.assertAlmostEqual(
+                    float(expected[column]),
+                    float(actual[column]),
+                    places=9,
+                    msg=f"{column} @ step {expected['step']}",
+                )
+        # 累计时间应当继续增长，而不是从 0 重新开始，也不能在续训节点回退。
+        times = [float(record["wall_time_s"]) for record in resumed]
+        self.assertEqual(times, sorted(times), "续训后 wall_time_s 必须单调不减")
+        self.assertGreater(times[0], 0)
+        resume_record = json.loads(
+            (partial / "resume.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(resume_record["start_step"], 2)
+        self.assertEqual(resume_record["target_steps"], 4)
+
+    def test_resume_rejects_changed_data(self):
+        out = self.tmp_path / "out"
+        self.train(out, "--max-iters", 2, "--eval-interval", 2)
+        # 字符集不变（词表一致），只有内容不同，应被数据摘要校验拦住。
+        other = self.tmp_path / "other.txt"
+        other.write_text(
+            self.data.read_text(encoding="utf-8") + "abcd\n" * 10, encoding="utf-8"
+        )
+        message = run_python_failing(
+            ROOT / "train.py",
+            "--data",
+            other,
+            "--out-dir",
+            out,
+            *SMALL_TRAIN_ARGS,
+            "--max-iters",
+            4,
+            "--eval-interval",
+            2,
+            "--resume",
+            out / "last.pt",
+            cwd=self.tmp_path,
+        )
+        self.assertIn("拒绝续训", message)
+
+    def test_resume_requires_larger_max_iters(self):
+        out = self.tmp_path / "out"
+        self.train(out, "--max-iters", 2, "--eval-interval", 2)
+        message = run_python_failing(
+            ROOT / "train.py",
+            "--data",
+            self.data,
+            "--out-dir",
+            out,
+            *SMALL_TRAIN_ARGS,
+            "--max-iters",
+            2,
+            "--eval-interval",
+            2,
+            "--resume",
+            out / "last.pt",
+            cwd=self.tmp_path,
+        )
+        self.assertIn("无需续训", message)
 
 
 @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "需要安装 matplotlib")

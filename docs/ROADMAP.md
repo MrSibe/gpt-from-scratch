@@ -119,9 +119,11 @@ runs/<experiment-id>/
 | lr / grad_norm | 学习率 / 裁剪前梯度范数（当前无裁剪，`grad_clip: null`） |
 | step_time_s / train_tokens_per_sec | 纯训练单步时间与吞吐 |
 | peak_memory_mb | 该步（含该步内评估）CUDA 峰值 allocated 显存，CPU 为空 |
-| eval_time_s / wall_time_s | 该次评估耗时 / 从训练开始的累计时间（含评估与保存） |
+| eval_time_s / wall_time_s | 该次评估耗时 / 从训练开始的累计时间（含评估与保存，续训后继续累加） |
 
 `metrics.csv` 的浮点数保留 6 位小数，`summary.json` 保留完整精度。
+
+仍待完成：`lr` 目前是常量，引入 scheduler/scaler 后需要把它们的 state 一并存入 `last.pt`。
 
 ### 已生成的图表
 
