@@ -7,7 +7,9 @@
 - `model.py`：模型和自回归生成。
 - `data.py`：字符编码、数据划分和 batch 采样。
 - `train.py` / `generate.py`：训练和生成入口。
-- `tests/test_smoke.py`：正确性与训练→保存→生成闭环测试。
+- `runlog.py`：实验目录、配置快照和指标 CSV。
+- `plot.py`：对比多个实验的曲线。
+- `tests/test_smoke.py`：正确性、实验记录与训练→保存→生成闭环测试。
 
 ## 环境
 
@@ -23,6 +25,7 @@ uv sync
 ## 快速验证闭环
 
 下面是小模型短跑，只验证流程，不代表训练质量。默认数据文件不存在时会下载 Tiny Shakespeare，需要联网。
+若 `out/smoke` 已存在，目录名会自动变成 `out/smoke-2` 等，请以打印出的路径为准。
 
 ```bash
 uv run python train.py \
@@ -32,7 +35,7 @@ uv run python train.py \
   --out-dir out/smoke
 
 uv run python generate.py \
-  --device cpu --ckpt out/smoke/ckpt.pt \
+  --device cpu --ckpt out/smoke/best.pt \
   --prompt "To be" --tokens 100 --seed 1337
 ```
 
@@ -40,19 +43,63 @@ uv run python generate.py \
 当前按前 90% / 后 10% 划分训练集和验证集，每部分都需要至少 `block_size + 2` 个字符。
 生成 prompt 必须非空，且所有字符都在训练词表内；temperature 应大于零。
 
-完整默认配置的训练和生成：
+完整默认配置的训练：
 
 ```bash
 uv run python train.py
-uv run python generate.py --ckpt out/ckpt.pt --prompt "To be" --seed 1337
 ```
 
+不指定 `--out-dir` 时，实验目录是 `runs/<本地时间>-gpt<n_layer>x<n_embd>/`，例如
+`runs/20260916-170355-gpt6x384/`；该路径会直接打印出来。
 默认模型比短跑配置大得多；显存不足时，先减小 `--batch-size`，必要时减小上下文和模型规模。
 更多参数见 `uv run python train.py --help` 和 `uv run python generate.py --help`。
 
+## 实验记录
+
+每次训练都会写入一个独立目录（默认在 `runs/` 下，已被 git 忽略）：
+
+```text
+runs/20260916-170355-gpt6x384/
+  config.json    模型/训练配置、数据摘要、代码版本和运行环境
+  metrics.csv    每步一行的指标，可直接用 pandas 或表格软件读取
+  best.pt        验证 loss 最低的权重，供 generate.py 使用
+  summary.json   训练结束时的汇总
+```
+
+- 目录已存在时自动改用 `-2`、`-3` 后缀，不会覆盖旧实验；实际路径在启动时打印。
+- `metrics.csv` 的列定义见 `runlog.py` 中的 `METRIC_FIELDS`，每行对应一次参数更新：
+
+  | 列 | 含义 |
+  | --- | --- |
+  | `step` / `tokens_seen` | 已完成的参数更新次数 / 累计训练 token（不含评估） |
+  | `train_loss_step` | 当前步的训练 loss |
+  | `train_loss_eval` / `val_loss` | 评估时的平均训练/验证 loss，只在评估步有值 |
+  | `lr` / `grad_norm` | 学习率 / 裁剪前梯度范数（尚未启用裁剪） |
+  | `step_time_s` / `train_tokens_per_sec` | 单步时间 / 该步训练吞吐 |
+  | `peak_memory_mb` | 该步（含该步内的评估）CUDA 峰值 allocated 显存，CPU 运行时为空 |
+  | `eval_time_s` / `wall_time_s` | 该次评估耗时 / 从训练开始累计的时间 |
+
+- 评估使用独立随机数流，并在每个评估点复用同一组固定 batch：
+
+  - 改 `--eval-interval` 不会改变训练数据顺序，两次实验的逐步训练指标可以逐位对比；
+  - 同 `--seed` 的实验使用完全相同的评估样本。
+- `wall_time_s` 包含评估和保存开销，只有 `step_time_s` / `train_tokens_per_sec` 是纯训练指标。
+
+### 绘图
+
+```bash
+uv run python plot.py                        # 对比 runs/ 下全部实验
+uv run python plot.py runs/a runs/b          # 只对比指定实验
+uv run python plot.py --smooth 50 --out runs/latest.png
+```
+
+输出四张子图：验证 loss 对训练 token、验证 loss 对累计时间、逐步训练吞吐、逐步峰值显存。
+坐标轴标签使用英文，避免缺少中文字体的系统显示方块。
+图例取自目录名，并带上 `config.json` 中的参数量。
+
 ## Checkpoint 约定
 
-- `out/ckpt.pt` 保存验证 loss 最好的模型，重复使用同一个输出目录会覆盖该文件。
+- `best.pt` 保存验证 loss 最好的模型。
 - `config` 保存为普通字典；生成端使用 `torch.load(..., weights_only=True)`。
 - `iter` 表示已完成的参数更新次数；评估发生在更新后，最后一步也会评估。
 - 当前文件用于推理，不包含 optimizer / RNG 等完整训练状态，**不支持断点续训**。
@@ -64,5 +111,6 @@ uv run python generate.py --ckpt out/ckpt.pt --prompt "To be" --seed 1337
 uv run python -m unittest discover -s tests -v
 ```
 
-测试使用 CPU 和临时本地语料，不下载数据、不依赖 GPU，也不会覆盖 `out/` 中的模型。
-覆盖前向/反向、因果性、小 batch 过拟合、保存加载一致性、导入无副作用和 CLI 生成闭环。
+测试使用 CPU 和临时本地语料，不下载数据、不依赖 GPU，也不会覆盖 `runs/` 中的记录。
+覆盖前向/反向、因果性、小 batch 过拟合、保存加载一致性、导入无副作用、实验记录内容、
+评估随机数隔离（改变评估频率不改变训练指标）和 CLI 生成闭环，以及绘图脚本的冒烟测试。

@@ -69,51 +69,66 @@ uv run python -m unittest discover -s tests -v
 ```
 
 测试无需 GPU 或网络。闭环通过只说明代码流程正确，不代表生成质量已经达标。
-当前 `ckpt.pt` 是最佳验证模型，不是完整续训状态；旧配置对象格式的兼容说明见 [README](../README.md#checkpoint-约定)。
+`best.pt` 只保存最佳验证模型，不是完整续训状态；旧配置对象格式的兼容说明见 [README](../README.md#checkpoint-约定)。
 
 ## P1：先建立最小实验记录
 
 **问题：如何判断下一次改动真的更好，而不是训练数据或计时方式变了？**
 
-### 实现顺序
+### 已实现（`train.py` + `runlog.py` + `plot.py`）
 
-- [ ] 为每个实验创建独立目录，避免覆盖 checkpoint。
-- [ ] 保存 `config.json`：模型/训练配置、seed、数据标识或哈希、代码版本及工作区是否有修改、软硬件信息。
-- [ ] 保存 `metrics.csv`，使用标准库即可，不急着引入 pandas。
-- [ ] 固定验证窗口，或使用独立评估 RNG；评估不能消耗训练使用的随机数流。
-- [ ] 增加简单 Matplotlib 脚本，对比多个实验。
-- [ ] 分离 `best.pt` 与 `last.pt`；后者保存 optimizer、step、best loss、RNG，以及引入后的 scheduler/scaler 状态。
+- [x] 为每个实验创建独立目录（默认 `runs/<本地时间>-<标签>/`），已存在的目录自动加后缀，不覆盖旧记录。
+- [x] 保存 `config.json`：模型/训练配置、seed、数据路径与 SHA-256、vocab 与 token 数、
+      参数量、代码提交与是否有未提交改动、Python/torch/CUDA/设备信息。
+- [x] 保存 `metrics.csv`，只依赖标准库，逐步写入并 flush；评估中断也能保留已有行。
+- [x] 固定评估样本 + 独立评估随机数流：每个评估点复用同一组 batch，且训练与评估
+      都使用各自的 `torch.Generator`，改变 `--eval-interval` 不影响训练数据顺序
+      （已有测试逐位对比逐步训练指标）。
+- [x] 增加 Matplotlib 对比脚本 `plot.py`，输出验证 loss-训练 token、验证 loss-累计时间、
+      逐步吞吐、逐步峰值显存四张子图，支持多实验叠加和平滑窗口。
+- [x] `summary.json` 记录 best loss、best step、总耗时和峰值显存。
+- [x] 将 `runs/` 加入 `.gitignore`。
+
+### 仍未实现
+
+- [ ] 分离 `best.pt` 与 `last.pt`；后者保存 optimizer、step、best loss、RNG，
+      以及引入后的 scheduler/scaler 状态。
 - [ ] 增加续训测试：连续训练与保存后恢复训练，在受控 CPU 环境下应保持一致。
 
-建议目录：
+### 目录约定
 
 ```text
 runs/<experiment-id>/
   config.json
   metrics.csv
   best.pt
-  last.pt
-  plots/
+  summary.json
+  last.pt        # 待实现：完整训练状态
 ```
 
-这是未来目录约定；实现时也应将 `runs/` 中的大型实验产物加入忽略规则，不提交权重和语料。
+`--out-dir` 可以显式指定目录（同样不会覆盖已有实验）；不指定时用 `--runs-dir`（默认 `runs`）
+加时间戳和 `--run-name` 组成目录名。实验产物不提交。
 
-### 最小指标
+### 已记录的指标
 
-| 指标 | 用途 |
+| 列 | 用途 |
 | --- | --- |
-| step / tokens_seen | 标明优化器更新次数和累计训练数据量 |
-| train_loss / val_loss | 观察收敛与泛化 |
-| lr / grad_norm | 观察调度和训练稳定性；范数注明是否为裁剪前 |
-| train_tokens_per_sec | 衡量纯训练吞吐，明确是否包括数据传输 |
-| peak_memory_mb | 记录测量区间 CUDA 峰值 allocated 显存，必要时另记 reserved |
-| train_time_s / eval_time_s / wall_time_s | 区分纯训练时间、验证开销和端到端时间 |
+| step / tokens_seen | 优化器更新次数 / 累计训练 token（不含评估） |
+| train_loss_step | 当前步训练 loss，含 dropout，逐步波动较大 |
+| train_loss_eval / val_loss | 评估点上的平均训练/验证 loss，只在评估步有值 |
+| lr / grad_norm | 学习率 / 裁剪前梯度范数（当前无裁剪，`grad_clip: null`） |
+| step_time_s / train_tokens_per_sec | 纯训练单步时间与吞吐 |
+| peak_memory_mb | 该步（含该步内评估）CUDA 峰值 allocated 显存，CPU 为空 |
+| eval_time_s / wall_time_s | 该次评估耗时 / 从训练开始的累计时间（含评估与保存） |
 
-首批图表：
+`metrics.csv` 的浮点数保留 6 位小数，`summary.json` 保留完整精度。
+
+### 已生成的图表
 
 1. val loss vs tokens_seen：相同数据预算下的学习效果。
-2. val loss vs 累计训练时间：相同计算时间下的学习效果；另外记录端到端耗时。
-3. 吞吐和峰值显存对比：速度与资源成本。
+2. val loss vs 累计训练时间：相同计算时间下的学习效果。
+3. 逐步训练吞吐：速度成本。
+4. 逐步峰值显存：显存成本。
 
 ### 为什么先 CSV + Matplotlib
 
@@ -122,14 +137,18 @@ CSV 是可重用的原始记录，Matplotlib 便于离线比较。TensorBoard �
 
 ### 计时与评估注意事项
 
-- 当前打印的 `elapsed` 是包含评估、保存等操作的累计时间，不能直接作为训练吞吐。
-- CUDA 异步执行，专门 benchmark 时要 warmup，并使用 CUDA events 或在测量边界同步。
-- 编译耗时和稳态吞吐分别报告，不在每个训练操作之间插入同步。
-- 验证和训练显存分开测，按测量区间重置峰值统计。
-- 当前每次评估默认跑 200 个训练 batch 和 200 个验证 batch，调试时先降低 `--eval-iters`，正式比较再统一。
+- 累计时间 `wall_time_s` 包含评估、保存等操作，不能当作训练吞吐；只有 `step_time_s`
+  和 `train_tokens_per_sec` 是纯训练指标。
+- CUDA 异步执行：训练循环里已经逐步同步以便计时；专门 benchmark 时仍要 warmup，
+  并在测量边界同步；编译耗时和稳态吞吐要分别报告。
+- 单实验内部的 `peak_memory_mb` 每步重置峰值统计，但评估发生在同一步时，该步数值
+  包含评估的显存；跨实验比较显存时要保持 `--eval-interval` 一致。
+- 当前每次评估默认跑 200 个训练 batch 和 200 个验证 batch，调试时先降低 `--eval-iters`，
+  正式比较再统一。
 - 相同 seed 并不自动保证不同设备、不同 PyTorch 版本的结果完全一致。
 
-**验收：能复跑 baseline；仅改变评估频率，不会改变后续训练 batch 和 dropout 随机序列；能从日志重画对比图。**
+**验收：能复跑 baseline；仅改变评估频率，不会改变后续训练 batch 和 dropout 随机序列
+（已由测试保证）；能从日志重画对比图。**
 
 ## P2：第一个优化实验——SDPA
 
@@ -247,11 +266,17 @@ SFT / LoRA 也不能代替基本的预训练质量验证；Tiny Shakespeare 适�
 
 ## 下一步建议提交顺序
 
-1. **`feat: 增加最小实验记录与固定验证集`**：独立目录、配置 JSON、指标 CSV、训练与评估 RNG 隔离。
-2. **`feat: 增加实验曲线绘图`**：读取 CSV，画 loss-token、loss-time、吞吐/显存对比。
-3. **`perf: 增加可切换的 SDPA attention`**：先补一致性测试，再测性能。
-4. **`feat: 保存完整训练状态并支持恢复`**：为更长的训练实验打基础。
-5. 从 P3 中选择一项训练质量改动和一项效率改动，分别做独立实验。
+1. ~~`feat: 增加最小实验记录与固定验证集`~~（已完成，见 P1）。
+2. ~~`feat: 增加实验曲线绘图`~~（已完成，见 P1）。
+3. **`feat: 保存完整训练状态并支持恢复`**：`last.pt` + optimizer/RNG，为更长的训练实验和
+   随后所有对照实验打基础。
+4. **`perf: 增加可切换的 SDPA attention`**：先补一致性测试，再测性能（P2）。
+5. 从 P3 中选择一项训练质量改动（建议 warmup + cosine 或 AdamW 参数分组）和一项效率改动
+   （建议 BF16 autocast），分别做独立实验。
+
+首次小规模实测观察（Tiny Shakespeare，默认模型 10.8M，60 步，单卡 4060 Laptop）：
+裁剪前梯度范数长期在 300 以上，说明 P3 的梯度裁剪和 warmup 实验有实际动机，
+可以先用它验证“假设 → 对照 → 结论”的流程。
 
 不要提前把整个项目重构成通用训练框架。配置和接口随着真实实验需求增长即可。
 

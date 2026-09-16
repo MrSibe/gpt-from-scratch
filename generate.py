@@ -7,7 +7,7 @@ from model import GPT, GPTConfig
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", type=str, default="out/ckpt.pt")
+    p.add_argument("--ckpt", type=str, required=True, help="训练产物中的 best.pt")
     p.add_argument("--prompt", type=str, default="\n")
     p.add_argument("--tokens", type=int, default=500)
     p.add_argument("--temperature", type=float, default=0.8)

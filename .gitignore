@@ -12,3 +12,6 @@ wheels/
 # Project
 input.txt
 out/
+
+# 实验产物
+runs/

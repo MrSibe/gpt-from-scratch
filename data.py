@@ -22,6 +22,8 @@ class CharDataset:
         self.vocab_size = len(chars)
         self.stoi = {ch: i for i, ch in enumerate(chars)}
         self.itos = {i: ch for i, ch in enumerate(chars)}
+        self.path = path
+        self.val_ratio = val_ratio
 
         data = torch.tensor([self.stoi[c] for c in text], dtype=torch.long)
         n = int(len(data) * (1 - val_ratio))
@@ -31,10 +33,15 @@ class CharDataset:
         self.block_size = block_size
         self.device = device
 
-    def get_batch(self, split: str, batch_size: int):
-        """返回 (x, y)，y 是 x 右移一位的目标"""
+    def get_batch(self, split: str, batch_size: int, generator=None):
+        """返回 (x, y)，y 是 x 右移一位的目标。
+
+        传入 generator 时不消耗全局随机数流，训练与评估因此互不影响。
+        """
         data = self.train_data if split == "train" else self.val_data
-        ix = torch.randint(len(data) - self.block_size - 1, (batch_size,))
+        ix = torch.randint(
+            len(data) - self.block_size - 1, (batch_size,), generator=generator
+        )
         x = torch.stack([data[i : i + self.block_size] for i in ix])
         y = torch.stack([data[i + 1 : i + 1 + self.block_size] for i in ix])
         return x.to(self.device), y.to(self.device)
