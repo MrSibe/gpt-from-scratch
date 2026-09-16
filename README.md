@@ -28,7 +28,7 @@ Linux/Windows 配置了 PyTorch CUDA 13.0 包源，GPU 需要匹配的驱动。
 
 ```bash
 uv run python train.py \
-  --device cpu --block-size 32 --batch-size 4 \
+  --device cpu --dtype fp32 --block-size 32 --batch-size 4 \
   --n-layer 1 --n-head 2 --n-embd 32 \
   --max-iters 10 --eval-interval 10 --eval-iters 2 \
   --run-name smoke
@@ -50,10 +50,11 @@ uv run python generate.py \
 
 `train.py` 与 `benchmark.py` 共有：
 
-- `--attention manual|sdpa`：默认 manual。SDPA 使用因果模式，评估时关闭 dropout；
+- `--attention manual|sdpa`：默认 SDPA。SDPA 使用因果模式，评估时关闭 dropout；
   后端由 PyTorch 自动选择，**不保证使用 FlashAttention**。
-- `--dtype fp32|fp16|bf16`：默认 fp32。低精度仅支持 CUDA，用 autocast，权重保持 FP32；
+- `--dtype fp32|fp16|bf16`：默认 bf16。低精度仅支持 CUDA，用 autocast，权重保持 FP32；
   FP16 启用 GradScaler（梯度溢出会跳过该步更新），BF16 需设备支持。
+  **CPU 和较旧的 GPU 跑默认命令会直接报错，需要显式 `--dtype fp32`。**
 - `--compile`：只编译模型的 forward/backward，不含 Python 主循环和优化器。
 
 一次只改一个主要变量，先验正确性再测性能。不同精度/后端不保证逐位一致；
@@ -89,7 +90,7 @@ runs/<时间戳>-<run-name>/
 
 ```bash
 uv run python benchmark.py \
-  --device cuda --attention sdpa --dtype bf16 \
+  --device cuda --dtype bf16 \
   --batch-size 16 --block-size 256 \
   --warmup 50 --steps 100 --repeats 5 --run-name sdpa-bf16
 ```

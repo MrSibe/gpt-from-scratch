@@ -14,7 +14,7 @@ class GPTConfig:
     n_head: int = 6
     n_embd: int = 384
     dropout: float = 0.2
-    attention: str = "manual"
+    attention: str = "sdpa"
 
 
 class CausalSelfAttention(nn.Module):
