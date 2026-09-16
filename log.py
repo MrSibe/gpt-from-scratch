@@ -16,9 +16,12 @@ import torch
 # val_loss / grad_norm / wall_time_s 只在评估步有值；性能指标由 benchmark.py 记录。
 METRIC_FIELDS = (
     "step",
+    "optimizer_steps",
+    "skipped_update",
     "tokens_seen",
     "train_loss_step",
     "val_loss",
+    "val_ppl",
     "lr",
     "grad_norm",
     "wall_time_s",
@@ -96,8 +99,6 @@ def _format_value(value):
         return ""
     if isinstance(value, bool):
         return int(value)
-    if isinstance(value, float):
-        return round(value, 6)
     return value
 
 

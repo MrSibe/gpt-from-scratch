@@ -8,12 +8,12 @@ from torch import nn
 
 @dataclass
 class GPTConfig:
-    vocab_size: int = 65
+    vocab_size: int = 8192
     block_size: int = 256
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
-    dropout: float = 0.2
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
+    dropout: float = 0.1
     attention: str = "sdpa"
 
 
@@ -119,7 +119,12 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_id=None):
+        if idx.size(1) == 0 or temperature <= 0 or not math.isfinite(temperature):
+            raise ValueError("prompt 不能为空，temperature 必须是有限正数")
+        if max_new_tokens < 0 or (top_k is not None and top_k <= 0):
+            raise ValueError("max_new_tokens 必须非负，top_k 必须为正或 None")
+        finished = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.cfg.block_size :]
             logits, _ = self(idx_cond)
@@ -129,5 +134,10 @@ class GPT(nn.Module):
                 logits[logits < v[:, [-1]]] = -float("inf")
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
+            if eos_id is not None:
+                idx_next[finished] = eos_id
+                finished |= idx_next[:, 0] == eos_id
             idx = torch.cat((idx, idx_next), dim=1)
+            if eos_id is not None and finished.all():
+                break
         return idx

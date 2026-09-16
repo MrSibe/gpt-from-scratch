@@ -34,13 +34,16 @@ def parse_args(argv=None):
     p.add_argument("--run-name", default="benchmark")
     p.add_argument("--device", choices=("cpu", "cuda"), default=None)
     p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--block-size", type=positive_int, default=256)
-    p.add_argument("--batch-size", type=positive_int, default=64)
-    p.add_argument("--vocab-size", type=positive_int, default=65)
-    p.add_argument("--n-layer", type=positive_int, default=6)
-    p.add_argument("--n-head", type=positive_int, default=6)
-    p.add_argument("--n-embd", type=positive_int, default=384)
-    p.add_argument("--attention", choices=("manual", "sdpa"), default="sdpa")
+    p.add_argument("--block-size", type=positive_int, default=GPTConfig.block_size)
+    p.add_argument("--batch-size", type=positive_int, default=16)
+    p.add_argument("--vocab-size", type=positive_int, default=GPTConfig.vocab_size)
+    p.add_argument("--n-layer", type=positive_int, default=GPTConfig.n_layer)
+    p.add_argument("--n-head", type=positive_int, default=GPTConfig.n_head)
+    p.add_argument("--n-embd", type=positive_int, default=GPTConfig.n_embd)
+    p.add_argument("--dropout", type=float, default=GPTConfig.dropout)
+    p.add_argument(
+        "--attention", choices=("manual", "sdpa"), default=GPTConfig.attention
+    )
     p.add_argument("--dtype", choices=("fp32", "fp16", "bf16"), default="bf16")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--warmup", type=positive_int, default=50)
@@ -54,6 +57,8 @@ def parse_args(argv=None):
         p.error("当前 fp16/bf16 实验仅支持 CUDA；CPU 请使用 fp32")
     if args.dtype == "bf16" and not torch.cuda.is_bf16_supported():
         p.error("当前设备不支持 BF16")
+    if not 0 <= args.dropout < 1:
+        p.error("dropout 必须在 [0, 1)")
     if args.n_embd % args.n_head:
         p.error("n-embd 必须能整除 n-head")
     if not args.run_name or any(c in args.run_name for c in "/\\"):
@@ -64,6 +69,12 @@ def parse_args(argv=None):
 def synchronize(device):
     if device == "cuda":
         torch.cuda.synchronize()
+
+
+def optimizer_steps(optimizer):
+    """AdamW 为每个有梯度的参数计数；本模型每步都会更新第一个参数。"""
+    parameter = optimizer.param_groups[0]["params"][0]
+    return int(optimizer.state.get(parameter, {}).get("step", 0))
 
 
 def main(argv=None):
@@ -77,6 +88,7 @@ def main(argv=None):
         n_head=args.n_head,
         n_embd=args.n_embd,
         attention=args.attention,
+        dropout=args.dropout,
     )
     raw_model = GPT(cfg).to(device)
     model = torch.compile(raw_model) if args.compile else raw_model
@@ -115,16 +127,25 @@ def main(argv=None):
 
     windows = []
     for index in range(args.repeats):
+        updates_before = optimizer_steps(optimizer)
         synchronize(device)
         start = time.perf_counter()
         for _ in range(args.steps):
             loss = step()
         synchronize(device)
         elapsed = time.perf_counter() - start
+        # 在计时外读取计数；FP16 跳步会省掉 AdamW，不能混作完整更新的吞吐。
+        updates = optimizer_steps(optimizer) - updates_before
+        if updates != args.steps:
+            raise RuntimeError(
+                f"测速窗口只完成 {updates}/{args.steps} 次 optimizer 更新；"
+                "可能发生 FP16 溢出，请增加 warmup 或更换精度后重测"
+            )
         windows.append(
             {
                 "window": index + 1,
                 "steps": args.steps,
+                "optimizer_steps": updates,
                 "elapsed_s": elapsed,
                 "step_time_s": elapsed / args.steps,
                 "tokens_per_sec": args.batch_size

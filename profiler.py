@@ -30,13 +30,16 @@ def parse_args(argv=None):
     p.add_argument("--run-name", default="profiler")
     p.add_argument("--device", choices=("cpu", "cuda"), default=None)
     p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--block-size", type=positive_int, default=256)
-    p.add_argument("--batch-size", type=positive_int, default=64)
-    p.add_argument("--vocab-size", type=positive_int, default=65)
-    p.add_argument("--n-layer", type=positive_int, default=6)
-    p.add_argument("--n-head", type=positive_int, default=6)
-    p.add_argument("--n-embd", type=positive_int, default=384)
-    p.add_argument("--attention", choices=("manual", "sdpa"), default="sdpa")
+    p.add_argument("--block-size", type=positive_int, default=GPTConfig.block_size)
+    p.add_argument("--batch-size", type=positive_int, default=16)
+    p.add_argument("--vocab-size", type=positive_int, default=GPTConfig.vocab_size)
+    p.add_argument("--n-layer", type=positive_int, default=GPTConfig.n_layer)
+    p.add_argument("--n-head", type=positive_int, default=GPTConfig.n_head)
+    p.add_argument("--n-embd", type=positive_int, default=GPTConfig.n_embd)
+    p.add_argument("--dropout", type=float, default=GPTConfig.dropout)
+    p.add_argument(
+        "--attention", choices=("manual", "sdpa"), default=GPTConfig.attention
+    )
     p.add_argument("--dtype", choices=("fp32", "fp16", "bf16"), default="bf16")
     p.add_argument("--compile", action="store_true")
     p.add_argument(
@@ -59,6 +62,8 @@ def parse_args(argv=None):
         p.error("当前 fp16/bf16 实验仅支持 CUDA；CPU 请使用 fp32")
     if args.dtype == "bf16" and not torch.cuda.is_bf16_supported():
         p.error("当前设备不支持 BF16")
+    if not 0 <= args.dropout < 1:
+        p.error("dropout 必须在 [0, 1)")
     if args.n_embd % args.n_head:
         p.error("n-embd 必须能整除 n-head")
     if not args.run_name or any(c in args.run_name for c in "/\\"):
@@ -82,6 +87,7 @@ def main(argv=None):
         n_head=args.n_head,
         n_embd=args.n_embd,
         attention=args.attention,
+        dropout=args.dropout,
     )
     raw_model = GPT(cfg).to(device).train()
     model = torch.compile(raw_model) if args.compile else raw_model

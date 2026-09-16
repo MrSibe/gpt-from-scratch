@@ -1,12 +1,13 @@
 [project]
 name = "mrsibe-llm"
 version = "0.1.0"
-description = "Add your description here"
+description = "A readable GPT lab for language model training, inference, and optimization"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.11.2",
     "numpy>=2.5.3",
+    "tokenizers>=0.22,<0.23",
     "torch>=2.14.0",
 ]
 
@@ -17,8 +18,5 @@ explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchvision = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]

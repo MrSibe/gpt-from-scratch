@@ -39,7 +39,10 @@ def parse_args(argv=None):
         help="逐步指标的滑动平均窗口，1 表示不平滑",
     )
     p.add_argument("--dpi", type=int, default=140)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.smooth < 1 or args.dpi < 1:
+        p.error("smooth 和 dpi 必须为正整数")
+    return args
 
 
 def find_run_dirs(paths):
@@ -88,7 +91,7 @@ def series(columns, x_key, y_key):
 
 
 def smooth(values, window):
-    if window <= 1 or len(values) <= window:
+    if window <= 1:
         return values
     result = []
     total = 0.0
@@ -139,25 +142,31 @@ def plot_runs(runs, smooth_window, out_path, dpi):
     _, unit = time_axis(all_times)
     divisor = {"s": 1, "min": 60, "h": 3600}[unit]
 
-    for run_dir, columns in loaded.items():
+    for index, (run_dir, columns) in enumerate(loaded.items()):
         label = label_for(run_dir)
+        color = f"C{index % 10}"
 
         # 训练 loss 逐步波动较大，用细线并做平滑；验证 loss 保留原始点。
         xs, ys = series(columns, "tokens_seen", "train_loss_step")
         if xs:
             axes["val_loss_vs_tokens"].plot(
-                xs, smooth(ys, smooth_window), linewidth=0.7, alpha=0.4
+                xs, smooth(ys, smooth_window), linewidth=0.7, alpha=0.4, color=color
             )
         xs, ys = series(columns, "tokens_seen", "val_loss")
         if xs:
             axes["val_loss_vs_tokens"].plot(
-                xs, ys, marker="o", markersize=3, label=label
+                xs, ys, marker="o", markersize=3, label=label, color=color
             )
 
         xs, ys = series(columns, "wall_time_s", "val_loss")
         if xs:
             axes["val_loss_vs_time"].plot(
-                [x / divisor for x in xs], ys, marker="o", markersize=3, label=label
+                [x / divisor for x in xs],
+                ys,
+                marker="o",
+                markersize=3,
+                label=label,
+                color=color,
             )
 
     axes["val_loss_vs_tokens"].set(
