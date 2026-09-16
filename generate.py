@@ -13,11 +13,13 @@ def main():
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--device", choices=("cpu", "cuda"), default=None)
     args = p.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+    # 新 checkpoint 只包含张量和基础 Python 类型，无需反序列化配置类。
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=True)
     cfg = GPTConfig(**ckpt["config"])
     model = GPT(cfg).to(device)
     model.load_state_dict(ckpt["model"])
