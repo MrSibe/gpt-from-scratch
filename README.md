@@ -4,7 +4,7 @@
 主线使用 **TinyStories V2 GPT-4 + byte-level BPE**，保留字符级路径用于快速排错。
 模型是 Pre-LayerNorm + 绝对位置编码 + GELU FFN 的 decoder-only GPT，支持手写因果注意力与 SDPA。
 不引入 Trainer 框架，训练核心在 `train.py` 的 `get_lr()` 和 `train_step()`。
-模型默认参数统一定义在 `model.py` 的 `GPTConfig`，各脚本通过 CLI 覆盖。
+模型默认参数统一定义在 `model.py` 的 `GPTConfig`，训练超参数默认值在 `train.py`，各脚本通过 CLI 覆盖。
 
 | 文件 | 作用 |
 | --- | --- |
@@ -104,8 +104,9 @@ uv run python generate.py \
 ```
 
 默认模型 8 层 / 8 头 / 512 维、context=256、dropout=0.1，词表为 8192 时约 **33.75M 参数**，
-输入输出 embedding 不共享。默认 BF16、micro-batch=16、累积 8 次，即 **32768 tokens/update**；
-3000 次更新尝试约处理 98.3M tokens。这是 RTX 4060 Laptop 8GB 的起步配置，不是最优长训结论。
+输入输出 embedding 默认不共享（`--tie-embeddings` 共享后约 **29.55M**）。
+默认 BF16、micro-batch=16、累积 8 次，即 **32768 tokens/update**；
+20000 次更新尝试约处理 655.36M tokens（约 19.4 tokens/参数）。这是 RTX 4060 Laptop 8GB 的起步配置，不是最优长训结论。
 
 训练只读取已准备的数据，不自动下载全量数据；缺失时会提示先运行 `prepare.py`。
 其他数据可通过训练的 `--data` 显式选择；checkpoint 仅用于生成，不支持恢复训练。
@@ -151,23 +152,28 @@ prompt 必须非空，temperature 为有限正数；字符模型不接受词表�
 | `--dropout` | 0.1 | 0 / 0.1 / 0.2 |
 | `--batch-size` | 16 | 每个 micro-step 的序列数：8 / 16 / 32 |
 | `--grad-accum-steps` | 8 | 与 batch 联动，保持 tokens/update 一致 |
-| `--lr` | 3e-4 | 1e-4 / 3e-4 / 1e-3 |
+| `--lr` | 1e-3 | 1e-4 / 3e-4 / 1e-3 / 2e-3 |
 | `--betas` | 0.9 0.95 | AdamW 的两个 beta |
 | `--weight-decay` | 0.1 | 0 / 0.01 / 0.1；所有参数统一衰减 |
 | `--lr-schedule` | `cosine` | `constant` / `cosine` |
 | `--warmup-ratio` / `--warmup-iters` | 0.02 / 未指定 | 二选一；默认 ratio × max-iters 向下取整 |
 | `--min-lr` | 3e-5 | cosine 终点；constant 时忽略 |
 | `--grad-clip` | 1.0 | 0 关闭 / 1.0 开启 |
-| `--max-iters` | 3000 | 更新尝试次数，不是 micro-step 数 |
+| `--max-iters` | 20000 | 更新尝试次数，不是 micro-step 数 |
 | `--eval-interval` | 250 | 每多少次更新尝试做一次验证 |
 | `--eval-batch-size / --eval-iters` | 16 / 50 | 消融时固定验证 token 预算 |
 | `--seed` | 1337 | 重复实验时更换随机种子 |
 | `--attention` | `sdpa` | `manual` / `sdpa` |
+| `--tie-embeddings` / `--no-tie-embeddings` | `--no-tie-embeddings` | 输入 embedding 与 `lm_head` 共享权重；GPT-2 的做法，省 `vocab_size × n_embd` 个参数（默认配置下 4.19M） |
 | `--dtype` | `bf16` | `fp32` / `fp16` / `bf16` |
 | `--compile` | 关闭 | 编译模型 forward/backward，不含 Python 循环和优化器 |
 
 关闭裁剪：`--grad-clip 0`；关闭调度和 warmup：`--lr-schedule constant --warmup-iters 0`；
 关闭累积：`--grad-accum-steps 1`。若想隔离“累积实现”的影响，关闭累积时同步放大 micro-batch，保持有效 batch 不变。
+
+权重共享：`--tie-embeddings` 让 `wte` 与 `lm_head` 指向同一张量。`named_parameters()` 会按张量身份去重，
+所以优化器不会对同一权重重复更新；`state_dict()` 仍同时保留 `wte.weight` 与 `lm_head.weight` 两个键，
+`generate.py` 通过 checkpoint 里的 `tie_embeddings` 重建模型，旧的不带该字段的 checkpoint 仍按不共享加载。
 
 核心顺序：设 LR → zero_grad → 多个 micro-batch 的 `loss / accum_steps` 分别 backward →
 FP16 unscale → 全局 norm 裁剪一次 → AdamW step 一次。无需保留多个 micro-batch 的计算图。

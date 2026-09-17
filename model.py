@@ -15,6 +15,7 @@ class GPTConfig:
     n_embd: int = 512
     dropout: float = 0.1
     attention: str = "sdpa"
+    tie_embeddings: bool = False
 
 
 class CausalSelfAttention(nn.Module):
@@ -93,6 +94,13 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size)
+        if cfg.tie_embeddings:
+            # 输入 embedding 与输出投影共享同一份权重（GPT-2 的做法）。
+            # 两者形状都是 (vocab_size, n_embd)，直接替换即可。
+            # named_parameters() / parameters() 会自动按张量身份去重，
+            # 所以优化器不会对同一张量重复更新；state_dict() 仍同时保留两个键，
+            # load_state_dict() 是原地 copy_，加载后共享关系不变。
+            self.lm_head.weight = self.wte.weight
 
     def forward(self, idx, targets=None):
         _, T = idx.shape

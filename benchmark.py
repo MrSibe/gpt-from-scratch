@@ -1,7 +1,7 @@
 """独立训练计算测速：设备上固定合成 batch，warmup 后按窗口测量。
 
 包含 forward/backward/AdamW/AMP scaler；不包含数据采样、H2D、评估、日志或保存。
-不导入 train.py，避免训练的观测逻辑进入计时区间。
+只从 train.py 取默认优化器超参数，不复用它的训练循环和观测逻辑。
 """
 
 import argparse
@@ -18,6 +18,7 @@ import torch
 
 from log import environment_info, git_info, unique_dir
 from model import GPT, GPTConfig
+from train import BETAS, LR, WEIGHT_DECAY
 
 
 def positive_int(value):
@@ -41,6 +42,12 @@ def parse_args(argv=None):
     p.add_argument("--n-head", type=positive_int, default=GPTConfig.n_head)
     p.add_argument("--n-embd", type=positive_int, default=GPTConfig.n_embd)
     p.add_argument("--dropout", type=float, default=GPTConfig.dropout)
+    p.add_argument(
+        "--tie-embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=GPTConfig.tie_embeddings,
+        help="输入 embedding 与输出投影共享权重；默认不共享",
+    )
     p.add_argument(
         "--attention", choices=("manual", "sdpa"), default=GPTConfig.attention
     )
@@ -89,11 +96,12 @@ def main(argv=None):
         n_embd=args.n_embd,
         attention=args.attention,
         dropout=args.dropout,
+        tie_embeddings=args.tie_embeddings,
     )
     raw_model = GPT(cfg).to(device)
     model = torch.compile(raw_model) if args.compile else raw_model
     optimizer = torch.optim.AdamW(
-        raw_model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1
+        raw_model.parameters(), lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY
     )
     scaler = torch.amp.GradScaler("cuda", enabled=args.dtype == "fp16")
     x = torch.randint(cfg.vocab_size, (args.batch_size, cfg.block_size), device=device)
@@ -170,9 +178,9 @@ def main(argv=None):
         "model": asdict(cfg),
         "optimizer": {
             "name": "AdamW",
-            "lr": 3e-4,
-            "betas": [0.9, 0.95],
-            "weight_decay": 0.1,
+            "lr": LR,
+            "betas": list(BETAS),
+            "weight_decay": WEIGHT_DECAY,
         },
         "parameters": sum(p.numel() for p in raw_model.parameters()),
         "scope": "fixed device-resident synthetic batch: forward + backward + optimizer + scaler",

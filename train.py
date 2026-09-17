@@ -18,6 +18,17 @@ from data import BPE_DATA_PATH, DATA_PATH, BPEDataset, CharDataset
 from log import RunLogger, environment_info, git_info
 from model import GPT, GPTConfig
 
+# 训练超参数的默认值就写在这里：CLI 默认值和 benchmark.py / profiler.py 复现默认优化器
+# 配置时读的都是这几个常量，避免同一数值在多处各写一份后悄悄漂移。
+# 模型结构默认值仍归 model.GPTConfig。
+LR = 1e-3
+BETAS = (0.9, 0.95)
+WEIGHT_DECAY = 0.1
+MAX_ITERS = 20000
+WARMUP_RATIO = 0.02
+MIN_LR = 3e-5
+GRAD_CLIP = 1.0
+
 
 def positive_int(value):
     value = int(value)
@@ -44,7 +55,7 @@ def parse_args(argv=None):
     p.add_argument(
         "--max-iters",
         type=positive_int,
-        default=3000,
+        default=MAX_ITERS,
         help="更新尝试次数，不是 micro-step 数",
     )
     p.add_argument("--eval-interval", type=positive_int, default=250)
@@ -59,11 +70,17 @@ def parse_args(argv=None):
     p.add_argument("--n-head", type=positive_int, default=GPTConfig.n_head)
     p.add_argument("--n-embd", type=positive_int, default=GPTConfig.n_embd)
     p.add_argument("--dropout", type=float, default=GPTConfig.dropout)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
-    p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument(
-        "--grad-clip", type=float, default=1.0, help="全局梯度范数上限；0=不裁剪"
+        "--tie-embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=GPTConfig.tie_embeddings,
+        help="输入 embedding 与输出投影共享权重；默认不共享",
+    )
+    p.add_argument("--lr", type=float, default=LR)
+    p.add_argument("--betas", type=float, nargs=2, default=BETAS)
+    p.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+    p.add_argument(
+        "--grad-clip", type=float, default=GRAD_CLIP, help="全局梯度范数上限；0=不裁剪"
     )
     p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="cosine")
     warmup = p.add_mutually_exclusive_group()
@@ -71,11 +88,11 @@ def parse_args(argv=None):
     warmup.add_argument(
         "--warmup-ratio",
         type=float,
-        default=0.02,
+        default=WARMUP_RATIO,
         help="乘 max-iters 后向下取整；默认 2%%，也可用 warmup-iters 指定绝对步数",
     )
     p.add_argument(
-        "--min-lr", type=float, default=3e-5, help="cosine 的最后一次计划更新所用 LR"
+        "--min-lr", type=float, default=MIN_LR, help="cosine 的最后一次计划更新所用 LR"
     )
     p.add_argument(
         "--attention", choices=("manual", "sdpa"), default=GPTConfig.attention
@@ -237,6 +254,7 @@ def main(argv=None):
         n_embd=args.n_embd,
         dropout=args.dropout,
         attention=args.attention,
+        tie_embeddings=args.tie_embeddings,
     )
     raw_model = GPT(cfg).to(device)
     model = torch.compile(raw_model) if args.compile else raw_model

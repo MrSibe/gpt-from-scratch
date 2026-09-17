@@ -9,6 +9,7 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import asdict
 from itertools import pairwise
 from pathlib import Path
 from unittest.mock import patch
@@ -113,7 +114,7 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(
             args.batch_size * args.block_size * args.grad_accum_steps, 32768
         )
-        self.assertEqual((args.max_iters, args.warmup_iters), (3000, 60))
+        self.assertEqual((args.max_iters, args.warmup_iters), (20000, 400))
         self.assertEqual((args.lr_schedule, args.grad_clip), ("cosine", 1.0))
         self.assertEqual(train.get_lr(args.max_iters, args), args.min_lr)
         self.assertEqual(self.parse(["--tokenizer", "char"]).data, DATA_PATH)
@@ -121,7 +122,14 @@ class TrainingTests(unittest.TestCase):
         cfg = GPTConfig()
         for module in (benchmark, profiler):
             other = module.parse_args(["--device", "cpu", "--dtype", "fp32"])
-            for name in ("n_layer", "n_head", "n_embd", "block_size", "dropout"):
+            for name in (
+                "n_layer",
+                "n_head",
+                "n_embd",
+                "block_size",
+                "dropout",
+                "tie_embeddings",
+            ):
                 self.assertEqual(getattr(args, name), getattr(other, name))
                 self.assertEqual(getattr(args, name), getattr(cfg, name))
             self.assertEqual(other.vocab_size, cfg.vocab_size)
@@ -352,7 +360,7 @@ class TrainingTests(unittest.TestCase):
             ["--lr", "nan"],
             ["--betas", ".9", "1"],
             ["--warmup-ratio", "1"],
-            ["--warmup-iters", "5000"],
+            ["--warmup-iters", "5000", "--max-iters", "3000"],
             ["--lr-schedule", "cosine", "--min-lr", "1"],
             ["--warmup-iters", "1", "--warmup-ratio", ".1"],
         ]
@@ -433,6 +441,52 @@ class TrainingTests(unittest.TestCase):
             torch.testing.assert_close(
                 original[:, :4], modified[:, :4], atol=1e-9, rtol=1e-9
             )
+
+    def test_weight_tying_shares_one_tensor_end_to_end(self):
+        untied = tiny_model()
+        tied = tiny_model(tie_embeddings=True)
+        vocab, embd = tied.cfg.vocab_size, tied.cfg.n_embd
+        self.assertFalse(untied.cfg.tie_embeddings)
+        self.assertIsNot(untied.lm_head.weight, untied.wte.weight)
+        self.assertIs(tied.lm_head.weight, tied.wte.weight)
+
+        # named_parameters() 按张量身份去重，所以优化器不会重复更新共享权重。
+        tied_params = list(tied.parameters())
+        self.assertEqual(len(tied_params), len({id(p) for p in tied_params}))
+        self.assertEqual(
+            len(list(tied.named_parameters())),
+            len(list(untied.named_parameters())) - 1,
+        )
+        self.assertEqual(
+            sum(p.numel() for p in untied.parameters())
+            - sum(p.numel() for p in tied.parameters()),
+            vocab * embd,
+        )
+
+        # 反向只累积到共享的那一份权重上，两条路径的梯度合并在同一个 .grad。
+        x = torch.randint(vocab, (2, tied.cfg.block_size))
+        y = torch.randint(vocab, x.shape)
+        _, loss = tied(x, y)
+        loss.backward()
+        self.assertIsNotNone(tied.wte.weight.grad)
+        self.assertIs(tied.lm_head.weight.grad, tied.wte.weight.grad)
+
+        # state_dict 两个键都在；保存/加载后共享关系与数值都不变。
+        state = tied.state_dict()
+        self.assertIn("wte.weight", state)
+        self.assertIn("lm_head.weight", state)
+        buffer = io.BytesIO()
+        torch.save(state, buffer)
+        buffer.seek(0)
+        reloaded = tiny_model(tie_embeddings=True)
+        reloaded.load_state_dict(torch.load(buffer, weights_only=True))
+        self.assertIs(reloaded.lm_head.weight, reloaded.wte.weight)
+        torch.testing.assert_close(reloaded.wte.weight, tied.wte.weight)
+
+        # checkpoint 里存的是 asdict(cfg)，generate 用 GPTConfig(**config) 重建，
+        # 所以 tying 开关必须能原样往返，否则重建出来的模型不带共享。
+        self.assertIs(GPTConfig(**asdict(tied.cfg)).tie_embeddings, True)
+        self.assertIs(GPTConfig(**asdict(GPTConfig())).tie_embeddings, False)
 
     def test_eval_preserves_rng_and_training_mode(self):
         dataset = CharDataset(self.train_file, block_size=8)
