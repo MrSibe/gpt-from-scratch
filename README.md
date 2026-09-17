@@ -106,7 +106,8 @@ uv run python generate.py \
 默认模型 8 层 / 8 头 / 512 维、context=256、dropout=0.1，词表为 8192 时约 **33.75M 参数**，
 输入输出 embedding 默认不共享（`--tie-embeddings` 共享后约 **29.55M**）。
 默认 BF16、micro-batch=16、累积 8 次，即 **32768 tokens/update**；
-20000 次更新尝试约处理 655.36M tokens（约 19.4 tokens/参数）。这是 RTX 4060 Laptop 8GB 的起步配置，不是最优长训结论。
+20000 次更新尝试约处理 655.36M tokens（约 19.4 tokens/参数），已超过全量 train 的约 536.6M tokens，
+即默认配置会跨 epoch 重复采样。这是 RTX 4060 Laptop 8GB 的起步配置，不是最优长训结论。
 
 训练只读取已准备的数据，不自动下载全量数据；缺失时会提示先运行 `prepare.py`。
 其他数据可通过训练的 `--data` 显式选择；checkpoint 仅用于生成，不支持恢复训练。
@@ -159,7 +160,7 @@ prompt 必须非空，temperature 为有限正数；字符模型不接受词表�
 | `--warmup-ratio` / `--warmup-iters` | 0.02 / 未指定 | 二选一；默认 ratio × max-iters 向下取整 |
 | `--min-lr` | 3e-5 | cosine 终点；constant 时忽略 |
 | `--grad-clip` | 1.0 | 0 关闭 / 1.0 开启 |
-| `--max-iters` | 20000 | 更新尝试次数，不是 micro-step 数 |
+| `--max-iters` | 20000 | 更新尝试次数，不是 micro-step 数；默认值由 10000 步外推（那次 run 结束时 val 仍在下降），尚无跑完 20000 步的记录 |
 | `--eval-interval` | 250 | 每多少次更新尝试做一次验证 |
 | `--eval-batch-size / --eval-iters` | 16 / 50 | 消融时固定验证 token 预算 |
 | `--seed` | 1337 | 重复实验时更换随机种子 |
@@ -256,3 +257,7 @@ uv run python -m unittest discover -s tests -v
 单元测试不下载真实数据；CUDA 可用时额外测试 FP16 溢出跳步。
 
 `data/`、`input.txt`、`runs/` 和虚拟环境均不提交到 Git；发布源码后需自行准备数据和训练权重。
+
+## 许可
+
+MIT，见 [`LICENSE`](LICENSE)。
