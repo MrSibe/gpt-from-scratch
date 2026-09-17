@@ -109,6 +109,16 @@ uv run python generate.py \
 20000 次更新尝试约处理 655.36M tokens（约 19.4 tokens/参数），已超过全量 train 的约 536.6M tokens，
 即默认配置会跨 epoch 重复采样。这是 RTX 4060 Laptop 8GB 的起步配置，不是最优长训结论。
 
+默认配置跑完过一次完整 20000 步（本地记录 `runs/20260917-230245-gpt`）：**best val loss 1.2883 / ppl 3.63
+@ step 20000**，末步 train loss 1.3246，0 次跳步，655.36M tokens（1.22 epoch），
+墙钟 2h30m（约 72.9k tokens/s），峰值显存 1659 MB，评估点 grad norm 0.207–0.491
+（`--grad-clip 1.0` 从未生效，但 `grad_norm` 只在评估点记录）。
+**`best_step` 就是最后一步，val 在整个 20000 步里单调下降**：最后 5000 步斜率约
+−0.0063/1000 步，20 个评估点、单点噪声 0.0145，约 11σ，确认还在下降而不是收敛。
+但 cosine 此时已把 LR 退到 `--min-lr` 3e-5，**继续跑同一个 run 几乎没有收益**；
+想再降 loss 应重开 run 并放大 `--max-iters`（让 cosine 按新步数重新退火）。
+该 run 用的是旧验证预算（16×50），单点 val 噪声 ±0.028，与当前默认不可严格比较。
+
 `16 / 8` 这组比例是实测选出来的，不要在“显存还剩很多”的直觉下随手调大：
 在 RTX 4060 Laptop（功耗受限）上固定 32768 tokens/update，轮转跑 60 次更新各 3 遍，
 `16/8` 为 26.70s，`32/4` 为 27.17s（+1.8%），`64/2` 为 28.03s（+5.0%），峰值显存依次是
@@ -168,7 +178,7 @@ prompt 必须非空，temperature 为有限正数；字符模型不接受词表�
 | `--warmup-ratio` / `--warmup-iters` | 0.02 / 未指定 | 二选一；默认 ratio × max-iters 向下取整 |
 | `--min-lr` | 3e-5 | cosine 终点；constant 时忽略 |
 | `--grad-clip` | 1.0 | 0 关闭 / 1.0 开启 |
-| `--max-iters` | 20000 | 更新尝试次数，不是 micro-step 数；默认值由 10000 步外推（那次 run 结束时 val 仍在下降），尚无跑完 20000 步的记录 |
+| `--max-iters` | 20000 | 更新尝试次数，不是 micro-step 数（约 1.22 epoch）。20000 步跑完时 val 仍未饱和（末 5000 步 −0.0063/1000 步），但 LR 已退到 `--min-lr`，要再降 loss 需重开 run 放大此值 |
 | `--eval-interval` | 250 | 每多少次更新尝试做一次验证 |
 | `--eval-batch-size / --eval-iters` | 64 / 50 | 消融时固定验证 token 预算；默认约 82 万 token/次 |
 | `--seed` | 1337 | 重复实验时更换随机种子 |
