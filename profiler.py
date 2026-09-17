@@ -20,7 +20,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 
 from log import environment_info, git_info, unique_dir
 from model import GPT, GPTConfig
-from train import BETAS, LR, WEIGHT_DECAY
+from train import BETAS, LR, WEIGHT_DECAY, build_optimizer
 
 # --annotate-model 只包叶子模块：叶子自己的 kernel 时间就是这一行的 self time，
 # 可以直接跨层相加。如果连容器模块（Block / CausalSelfAttention）一起包，
@@ -185,9 +185,7 @@ def main(argv=None):
     # 先标注再 compile，让 dynamo 直接追踪包好的 forward。
     annotated = annotate_model(raw_model) if args.annotate_model else []
     model = torch.compile(raw_model) if args.compile else raw_model
-    optimizer = torch.optim.AdamW(
-        raw_model.parameters(), lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY
-    )
+    optimizer = build_optimizer(raw_model, LR, BETAS, WEIGHT_DECAY)
     scaler = torch.amp.GradScaler("cuda", enabled=args.dtype == "fp16")
     x = torch.randint(cfg.vocab_size, (args.batch_size, cfg.block_size), device=device)
     y = torch.randint(cfg.vocab_size, x.shape, device=device)

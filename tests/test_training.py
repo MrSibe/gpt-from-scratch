@@ -115,6 +115,9 @@ class TrainingTests(unittest.TestCase):
             args.batch_size * args.block_size * args.grad_accum_steps, 32768
         )
         self.assertEqual((args.max_iters, args.warmup_iters), (20000, 400))
+        # 验证预算决定消融能否读出差异：实测单次 val_loss 标准差 ~0.005。
+        self.assertEqual((args.eval_batch_size, args.eval_iters), (64, 50))
+        self.assertGreaterEqual(args.eval_batch_size * args.eval_iters, 3200)
         self.assertEqual((args.lr_schedule, args.grad_clip), ("cosine", 1.0))
         self.assertEqual(train.get_lr(args.max_iters, args), args.min_lr)
         self.assertEqual(self.parse(["--tokenizer", "char"]).data, DATA_PATH)
@@ -371,6 +374,39 @@ class TrainingTests(unittest.TestCase):
                 self.assertRaises(SystemExit),
             ):
                 self.parse(args)
+
+    def test_optimizer_decay_groups_are_dim_split_and_cover_all_params(self):
+        for tied in (False, True):
+            with self.subTest(tie_embeddings=tied):
+                model = tiny_model(tie_embeddings=tied)
+                optimizer = train.build_optimizer(model, 0.001, (0.9, 0.95), 0.1)
+                decay, no_decay = optimizer.param_groups
+                self.assertEqual(decay["weight_decay"], 0.1)
+                self.assertEqual(no_decay["weight_decay"], 0.0)
+                self.assertEqual(decay["lr"], 0.001)
+                self.assertEqual(list(decay["betas"]), [0.9, 0.95])
+
+                groups = [
+                    (decay, True),
+                    (no_decay, False),
+                ]
+                for group, decays in groups:
+                    for param in group["params"]:
+                        self.assertEqual(param.dim() >= 2, decays)
+                # 每个参数恰好出现一次，共享权重不会被更新两次。
+                params = [p for group, _ in groups for p in group["params"]]
+                self.assertEqual(len(params), len(list(model.parameters())))
+                self.assertEqual(len({id(p) for p in params}), len(params))
+
+                no_decay_ids = {id(p) for p in no_decay["params"]}
+                names = {
+                    n for n, p in model.named_parameters() if id(p) in no_decay_ids
+                }
+                self.assertIn("blocks.0.ln1.weight", names)
+                self.assertIn("blocks.0.ln1.bias", names)
+                self.assertIn("blocks.0.attn.q_proj.bias", names)
+                self.assertNotIn("wte.weight", names)
+                self.assertNotIn("lm_head.weight", names)
 
     def test_accumulation_matches_large_batch_and_clips_once(self):
         for clip in (0.0, 0.01):

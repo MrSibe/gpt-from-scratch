@@ -18,7 +18,7 @@ import torch
 
 from log import environment_info, git_info, unique_dir
 from model import GPT, GPTConfig
-from train import BETAS, LR, WEIGHT_DECAY
+from train import BETAS, LR, WEIGHT_DECAY, build_optimizer
 
 
 def positive_int(value):
@@ -79,9 +79,16 @@ def synchronize(device):
 
 
 def optimizer_steps(optimizer):
-    """AdamW 为每个有梯度的参数计数；本模型每步都会更新第一个参数。"""
-    parameter = optimizer.param_groups[0]["params"][0]
-    return int(optimizer.state.get(parameter, {}).get("step", 0))
+    """AdamW 为每个有梯度的参数计数；取任一已有 state 的参数即可。
+
+    优化器现在分成 decay / no-decay 两组，不再假定组 0 的第一个参数有 state。
+    """
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            state = optimizer.state.get(parameter)
+            if state:
+                return int(state["step"])
+    return 0
 
 
 def main(argv=None):
@@ -100,9 +107,7 @@ def main(argv=None):
     )
     raw_model = GPT(cfg).to(device)
     model = torch.compile(raw_model) if args.compile else raw_model
-    optimizer = torch.optim.AdamW(
-        raw_model.parameters(), lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY
-    )
+    optimizer = build_optimizer(raw_model, LR, BETAS, WEIGHT_DECAY)
     scaler = torch.amp.GradScaler("cuda", enabled=args.dtype == "fp16")
     x = torch.randint(cfg.vocab_size, (args.batch_size, cfg.block_size), device=device)
     y = torch.randint(cfg.vocab_size, x.shape, device=device)
@@ -181,6 +186,7 @@ def main(argv=None):
             "lr": LR,
             "betas": list(BETAS),
             "weight_decay": WEIGHT_DECAY,
+            "decay_scope": "dim>=2 only; LayerNorm and bias use weight_decay=0",
         },
         "parameters": sum(p.numel() for p in raw_model.parameters()),
         "scope": "fixed device-resident synthetic batch: forward + backward + optimizer + scaler",

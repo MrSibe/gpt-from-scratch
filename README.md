@@ -109,6 +109,14 @@ uv run python generate.py \
 20000 次更新尝试约处理 655.36M tokens（约 19.4 tokens/参数），已超过全量 train 的约 536.6M tokens，
 即默认配置会跨 epoch 重复采样。这是 RTX 4060 Laptop 8GB 的起步配置，不是最优长训结论。
 
+`16 / 8` 这组比例是实测选出来的，不要在“显存还剩很多”的直觉下随手调大：
+在 RTX 4060 Laptop（功耗受限）上固定 32768 tokens/update，轮转跑 60 次更新各 3 遍，
+`16/8` 为 26.70s，`32/4` 为 27.17s（+1.8%），`64/2` 为 28.03s（+5.0%），峰值显存依次是
+1659 / 2730 / 4874 MB；`128/1` 峰值达 9031 MB，**超过 8188 MiB 设备显存**，WSL 的 sysmem
+回退让它慢了约 5 倍。所以这里的显存余量是给更长的 `--block-size` 和评估留的安全边际，
+不是可兑换成吞吐的空间。换机器后应用同样的轮转方式重测（顺序跑会被功耗/温度漂移骗到，
+同配置热态比冷态慢约 9%）。
+
 训练只读取已准备的数据，不自动下载全量数据；缺失时会提示先运行 `prepare.py`。
 其他数据可通过训练的 `--data` 显式选择；checkpoint 仅用于生成，不支持恢复训练。
 
@@ -151,18 +159,18 @@ prompt 必须非空，temperature 为有限正数；字符模型不接受词表�
 | `--n-layer / --n-head / --n-embd` | 8 / 8 / 512 | 维度必须能被头数整除 |
 | `--block-size` | 256 | 256 / 512 |
 | `--dropout` | 0.1 | 0 / 0.1 / 0.2 |
-| `--batch-size` | 16 | 每个 micro-step 的序列数：8 / 16 / 32 |
+| `--batch-size` | 16 | 每个 micro-step 的序列数：8 / 16 / 32 / 64；与 `--grad-accum-steps` 联动，改 `16→32` 时把 `8→4` 才能保持 tokens/update 与 LR 不变 |
 | `--grad-accum-steps` | 8 | 与 batch 联动，保持 tokens/update 一致 |
 | `--lr` | 1e-3 | 1e-4 / 3e-4 / 1e-3 / 2e-3 |
 | `--betas` | 0.9 0.95 | AdamW 的两个 beta |
-| `--weight-decay` | 0.1 | 0 / 0.01 / 0.1；所有参数统一衰减 |
+| `--weight-decay` | 0.1 | 0 / 0.01 / 0.1；按 `dim>=2` 分组，只衰减矩阵权重，LayerNorm 与所有 bias 恒为 0 |
 | `--lr-schedule` | `cosine` | `constant` / `cosine` |
 | `--warmup-ratio` / `--warmup-iters` | 0.02 / 未指定 | 二选一；默认 ratio × max-iters 向下取整 |
 | `--min-lr` | 3e-5 | cosine 终点；constant 时忽略 |
 | `--grad-clip` | 1.0 | 0 关闭 / 1.0 开启 |
 | `--max-iters` | 20000 | 更新尝试次数，不是 micro-step 数；默认值由 10000 步外推（那次 run 结束时 val 仍在下降），尚无跑完 20000 步的记录 |
 | `--eval-interval` | 250 | 每多少次更新尝试做一次验证 |
-| `--eval-batch-size / --eval-iters` | 16 / 50 | 消融时固定验证 token 预算 |
+| `--eval-batch-size / --eval-iters` | 64 / 50 | 消融时固定验证 token 预算；默认约 82 万 token/次 |
 | `--seed` | 1337 | 重复实验时更换随机种子 |
 | `--attention` | `sdpa` | `manual` / `sdpa` |
 | `--tie-embeddings` / `--no-tie-embeddings` | `--no-tie-embeddings` | 输入 embedding 与 `lm_head` 共享权重；GPT-2 的做法，省 `vocab_size × n_embd` 个参数（默认配置下 4.19M） |
@@ -175,6 +183,10 @@ prompt 必须非空，temperature 为有限正数；字符模型不接受词表�
 权重共享：`--tie-embeddings` 让 `wte` 与 `lm_head` 指向同一张量。`named_parameters()` 会按张量身份去重，
 所以优化器不会对同一权重重复更新；`state_dict()` 仍同时保留 `wte.weight` 与 `lm_head.weight` 两个键，
 `generate.py` 通过 checkpoint 里的 `tie_embeddings` 重建模型，旧的不带该字段的 checkpoint 仍按不共享加载。
+
+权重衰减：AdamW 分成两组，`dim>=2` 的权重（embedding、各 Linear 与注意力的投影矩阵）用 `--weight-decay`，
+`dim<2` 的参数（LayerNorm 的 weight/bias、所有 Linear bias，默认配置下 83 个张量、约 6.2 万参数）恒不衰减。
+`benchmark.py` / `profiler.py` 复用 `train.build_optimizer`，三处不会漂移。
 
 核心顺序：设 LR → zero_grad → 多个 micro-batch 的 `loss / accum_steps` 分别 backward →
 FP16 unscale → 全局 norm 裁剪一次 → AdamW step 一次。无需保留多个 micro-batch 的计算图。
@@ -211,6 +223,10 @@ runs/<本地时间>-<run-name>/
 - 普通 BF16/FP32 步不读取 CUDA loss 标量，评估点批量传回；中断会丢失最近未写入的一段指标。
 - 验证使用独立固定 seed，关闭 dropout，最后一步也评估。等长 batch 的均值即 token 加权均值。
   随机窗口会重叠，不代表整份验证集的无重复遍历。
+- 默认验证预算 64×50 = 819,200 token/次：实测单次 `val_loss` 的标准差约 **0.005**
+  （旧的 16×50 = 204,800 token 约 **0.015**，单次评估 95% 区间达 ±0.028，比多数消融效应还大）。
+  因此**单点对比不可信**，消融要么用这个默认预算，要么比较多个评估点的趋势；
+  `best_val_loss` 是 80 个含噪评估点的最大值，本身偏乐观 0.01 量级。
 - 显存峰值在训练循环前重置，含驻留权重及循环中的训练/验证，不含初始化瞬时峰值；CPU 为 null。
 - checkpoint 仅使用一种格式：`model`、`config`、`tokenizer`、`iter`、`val_loss`。
   `best.pt` 不依赖原数据目录；加载使用 `weights_only=True`，compile 训练也保存标准权重名。
@@ -236,6 +252,12 @@ uv run python profiler.py \
 - 使用固定设备端合成 batch，包含 forward/backward、AdamW 与 AMP scaler；不含采样、H2D、验证、日志和保存。
 - **每一步是单 micro-batch + optimizer**，不包含训练器的梯度累积、clip 或 LR 调度。
   不能直接把这些单步耗时当作 `train.py` 的完整更新耗时。
+- 上面这条还有一层定量后果：benchmark 每个 micro-batch 都做一次 `zero_grad` + AdamW，
+  而 `train.py` 每个 update 只做一次，所以用它推断梯度累积的吞吐时会**系统性低估大 accum 的配置**。
+  实测这个“多出来的”优化器开销 c ≈ 6.4–9.2 ms/次（33.75M 参数、FP32 权重），
+  换算修正为 `update_time ≈ accum × (micro_step_time - c) + c`；
+  减掉这一项后，benchmark 里 `batch 32` 比 `batch 16` 快 6.8% 的优势会反号——
+  与端到端实测的 `32/4` 偏慢一致。
 - benchmark 在测量窗口两端同步，报告吞吐中位数/范围及平均单步时间；输出 config、benchmark.csv、summary。
   显存峰值在 warmup 后重置，包含驻留的模型和优化器状态；warmup 时间含首次编译。
   若测量窗口存在 FP16 跳步，benchmark 会拒绝该次结果，提示增加 warmup 或更换精度；成功更新计数在计时区间外检查。

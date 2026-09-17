@@ -63,8 +63,9 @@ def parse_args(argv=None):
     p.add_argument(
         "--eval-batch-size",
         type=positive_int,
-        default=16,
-        help="独立于训练 batch，消融时保持固定",
+        default=64,
+        help="独立于训练 batch，消融时保持固定；默认 64×50 约 82 万 token，"
+        "把单次评估的标准差压到 0.005 量级",
     )
     p.add_argument("--n-layer", type=positive_int, default=GPTConfig.n_layer)
     p.add_argument("--n-head", type=positive_int, default=GPTConfig.n_head)
@@ -165,6 +166,26 @@ def autocast(device, dtype):
     )
 
 
+def build_optimizer(model, lr, betas, weight_decay):
+    """AdamW 分两组：只有 dim>=2 的权重衰减，LayerNorm 与 bias 不衰减。
+
+    衰减 1 维参数（LN 的 weight/bias、所有 Linear bias）会把 LayerNorm 的增益往 0 拉，
+    属于常见但方向明确的错误；nanoGPT 同样按 dim>=2 分组。
+    两个 group 之间只是超参不同，参数集合不变；共享权重由 model.parameters() 去重，
+    不会被更新两次。
+    """
+    decay, no_decay = [], []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        (decay if param.dim() >= 2 else no_decay).append(param)
+    groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(groups, lr=lr, betas=tuple(betas))
+
+
 def train_step(
     model,
     optimizer,
@@ -258,12 +279,7 @@ def main(argv=None):
     )
     raw_model = GPT(cfg).to(device)
     model = torch.compile(raw_model) if args.compile else raw_model
-    optimizer = torch.optim.AdamW(
-        raw_model.parameters(),
-        lr=args.lr,
-        betas=tuple(args.betas),
-        weight_decay=args.weight_decay,
-    )
+    optimizer = build_optimizer(raw_model, args.lr, args.betas, args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=args.dtype == "fp16")
     train_rng = torch.Generator().manual_seed(args.seed)
     tokens_per_step = args.batch_size * cfg.block_size * args.grad_accum_steps
