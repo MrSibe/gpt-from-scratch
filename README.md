@@ -15,7 +15,7 @@
 | `train.py` | 梯度累积、调度、裁剪、验证、保存最佳模型 |
 | `generate.py` | 加载 `best.pt` 生成文本 |
 | `benchmark.py` | 独立的训练计算测速 |
-| `profiler.py` | 训练算子耗时、内存事件与 trace |
+| `profiler.py` | 训练算子耗时、显存事件、结构归因与 trace |
 | `log.py` / `plot.py` | 运行记录 / 多次训练曲线对比 |
 | `tests/` | 数据、训练数值、日志、生成和测速的回归测试 |
 
@@ -229,7 +229,8 @@ uv run python benchmark.py \
 
 uv run python profiler.py \
   --device cuda --dtype bf16 \
-  --warmup 10 --steps 5 --run-name profile-sdpa
+  --warmup 10 --steps 5 --annotate-model --with-flops \
+  --run-name profile-sdpa
 ```
 
 - 使用固定设备端合成 batch，包含 forward/backward、AdamW 与 AMP scaler；不含采样、H2D、验证、日志和保存。
@@ -240,8 +241,27 @@ uv run python profiler.py \
   若测量窗口存在 FP16 跳步，benchmark 会拒绝该次结果，提示增加 warmup 或更换精度；成功更新计数在计时区间外检查。
 - profiler 输出 `operators.txt` 与 `trace.json`；使用 <https://ui.perfetto.dev> 打开 trace，
   查看 `train/forward`、`train/backward`、`train/optimizer` 及实际 GPU kernels。
+  算子表本身就带 `CPU total` / `CUDA total` 列（可与 `Self` 列对照区分“自身耗时”与“含子节点耗时”）。
+- `--annotate-model` 把每个 `Linear` / `LayerNorm` / `Embedding` 的 forward 包一层
+  `record_function`，名字沿用 state_dict 路径，于是算子表里直接出现
+  `blocks.0.attn.q_proj` 这类行，并追加一张把 `blocks.<N>.` 前缀合并后的结构汇总表。
+  只包叶子模块：叶子自己的 kernel 时间就是该行的 self time，可以跨层相加；
+  包容器模块会让父行变成累计值，既不能相加也会与子行重复。
+  插桩只作用于 profiler 进程内的实例，`model.py` 保持干净，`train.py` / `benchmark.py` 不受影响
+  （8 层模型实测每步开销 < 0.1%）。
+  **注意它只覆盖 forward**：backward 的 kernel 由 autograd 引擎在标注区域外发起，
+  所以结构汇总表的占比是“标注模块内部”的占比，不是整个 step 的占比；
+  forward / backward / optimizer 的整体切分仍看 `train/*` 区域行。
+- `--with-flops` 估算 `mm` / `bmm` / `addmm` 的 FLOPs，并在表格中自动多出一列 `Total GFLOPs`，
+  同时把单步总量与每 token 的估算写进 `operators.txt`（默认配置实测约 722 GFLOP/step、
+  176 MFLOP/token，与 `2 × 参数量 × token` 的解析式相差 7% 以内）。
+  它只覆盖矩阵乘：SDPA 的注意力核心不是 matmul，因此 `--attention sdpa` 会低估，
+  `--attention manual` 才会把注意力的 `bmm` 计入。
+  该开关会自动打开 `record-shapes`（torch 的行为），但表格是否按形状分组仍只由 `--record-shapes` 决定。
 - `--record-shapes`、`--profile-memory`、`--with-stack` 会增加采集开销；`--row-limit` 控制表格长度。
   内存事件只覆盖采集窗口，self memory 是净分配量，可能为负。
+  `--with-stack` 还会在 trace 里生成 `nn.Module:` 层级，但这类事件不会进入 `key_averages()` 表格，
+  所以“表格里的结构归因”要用 `--annotate-model`，“trace 里的嵌套视图”用 `--with-stack`。
 - profiler 会扰动性能，不把它的耗时当作正式吞吐。稳定对照还需多次启动进程，并控制温度、功耗和后台负载。
 
 ## 绘图与测试
