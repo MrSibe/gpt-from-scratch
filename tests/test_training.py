@@ -110,7 +110,7 @@ class TrainingTests(unittest.TestCase):
         args = self.parse()
         self.assertEqual((args.tokenizer, args.data), ("bpe", BPE_DATA_PATH))
         self.assertEqual((args.n_layer, args.n_head, args.n_embd), (8, 8, 512))
-        self.assertEqual(args.dropout, 0.1)
+        self.assertEqual(args.dropout, 0.0)
         self.assertEqual(
             args.batch_size * args.block_size * args.grad_accum_steps, 32768
         )

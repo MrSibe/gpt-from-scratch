@@ -103,7 +103,7 @@ uv run python generate.py \
   --prompt "Once upon a time" --tokens 200 --seed 1337
 ```
 
-默认模型 8 层 / 8 头 / 512 维、context=256、dropout=0.1，词表为 8192 时约 **33.75M 参数**，
+默认模型 8 层 / 8 头 / 512 维、context=256、无 dropout，词表为 8192 时约 **33.75M 参数**，
 输入输出 embedding 默认不共享（`--tie-embeddings` 共享后约 **29.55M**）。
 默认 BF16、micro-batch=16、累积 8 次，即 **32768 tokens/update**；
 20000 次更新尝试约处理 655.36M tokens（约 19.4 tokens/参数），已超过全量 train 的约 536.6M tokens，
@@ -118,6 +118,13 @@ uv run python generate.py \
 但 cosine 此时已把 LR 退到 `--min-lr` 3e-5，**继续跑同一个 run 几乎没有收益**；
 想再降 loss 应重开 run 并放大 `--max-iters`（让 cosine 按新步数重新退火）。
 该 run 用的是旧验证预算（16×50），单点 val 噪声 ±0.028，与当前默认不可严格比较。
+
+`--dropout` 默认从 0.1 改为 0：这是**基于欠拟合证据的推断，尚无消融支持**。
+依据就是上面那次 run——`best_step` 就是最后一步、val 全程单调下降、末 5000 步斜率仍为
+−0.0069/1000 步，1.22 epoch 内看不到任何过拟合信号，此时 dropout 只是往激活里加噪声。
+预期收益与已实测的“权重衰减范围”同类（配对净差 0.0045），量级 0.005–0.02，
+**与单点评估精度 ±0.010 相当**；想验证它必须用同一评估预算（当前默认 64×50 + seed 1338）
+跑一次 `--dropout 0.1` 做配对对照，不能只看 `summary.json` 的绝对数字。
 
 `16 / 8` 这组比例是实测选出来的，不要在“显存还剩很多”的直觉下随手调大：
 在 RTX 4060 Laptop（功耗受限）上固定 32768 tokens/update，轮转跑 60 次更新各 3 遍，
@@ -168,7 +175,7 @@ prompt 必须非空，temperature 为有限正数；字符模型不接受词表�
 | `prepare.py --vocab-size` | 8192 | 4096 / 8192 / 16384；需重新准备数据，不是 train 参数 |
 | `--n-layer / --n-head / --n-embd` | 8 / 8 / 512 | 维度必须能被头数整除 |
 | `--block-size` | 256 | 256 / 512 |
-| `--dropout` | 0.1 | 0 / 0.1 / 0.2 |
+| `--dropout` | 0 | 0 / 0.1 / 0.2；默认 0 是欠拟合推断，尚无消融支持 |
 | `--batch-size` | 16 | 每个 micro-step 的序列数：8 / 16 / 32 / 64；与 `--grad-accum-steps` 联动，改 `16→32` 时把 `8→4` 才能保持 tokens/update 与 LR 不变 |
 | `--grad-accum-steps` | 8 | 与 batch 联动，保持 tokens/update 一致 |
 | `--lr` | 1e-3 | 1e-4 / 3e-4 / 1e-3 / 2e-3 |
@@ -198,6 +205,12 @@ prompt 必须非空，temperature 为有限正数；字符模型不接受词表�
 `dim<2` 的参数（LayerNorm 的 weight/bias、所有 Linear bias，默认配置下 83 个张量、约 6.2 万参数）恒不衰减。
 `benchmark.py` / `profiler.py` 复用 `train.build_optimizer`，三处不会漂移。
 
+实测收益（`20260918-111420-tinystories-v2` vs 前一次 `*-gpt`）：两次 run 的验证窗口集不同，
+直接比 `summary.json` 会得到 1.2883 → 1.2783 = 0.0100，但其中 0.0055 是窗口口径造成的水平偏移
+（同一个新检查点换回旧预算 16×50 只读到 1.2837）。把旧模型放回它自己的窗口集做配对比较后，
+净提升是 **0.0045**，且形态是前 10k 步略差（最多 −0.006）、12.5k 步附近交叉、后 7.5k 步持续反超——
+与“衰减后期才成为负担”的机制一致。结论是方向可信、量级未定（204,800 token 的配对分辨率约 0.005）。
+
 核心顺序：设 LR → zero_grad → 多个 micro-batch 的 `loss / accum_steps` 分别 backward →
 FP16 unscale → 全局 norm 裁剪一次 → AdamW step 一次。无需保留多个 micro-batch 的计算图。
 
@@ -224,7 +237,7 @@ runs/<本地时间>-<run-name>/
 | --- | --- |
 | `step` / `tokens_seen` | 更新尝试次数 / 已处理训练 token 数，含跳步时处理的 token，不含验证 |
 | `optimizer_steps` / `skipped_update` | 累计成功更新次数 / 本次是否因 FP16 溢出跳过更新 |
-| `train_loss_step` | 本次所有 micro-batch 的平均原始 loss，含 dropout |
+| `train_loss_step` | 本次所有 micro-batch 的平均原始 loss，含 dropout（默认 dropout=0 时与验证同口径） |
 | `lr` | 该次更新尝试实际使用的学习率，保留浮点精度，避免小 LR 被记为 0 |
 | `val_loss` / `val_ppl` | 固定验证窗口的 token 平均 NLL / exp(NLL)，仅评估点记录 |
 | `grad_norm` | unscale 后、clip 前的全局 L2 范数，仅评估点记录 |
@@ -245,7 +258,7 @@ runs/<本地时间>-<run-name>/
 
 ## 独立测速与算子分析
 
-两者默认模型形状与 V2 训练一致：8192 词表、8 层 / 8 头 / 512 维、dropout=0.1、batch=16、context=256。
+两者默认模型形状与 V2 训练一致：8192 词表、8 层 / 8 头 / 512 维、无 dropout、batch=16、context=256。
 如果实际 tokenizer 词表小于 8192，请用 `--vocab-size` 匹配。
 
 ```bash
